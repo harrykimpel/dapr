@@ -101,6 +101,7 @@ import (
 	"github.com/dapr/components-contrib/bindings/azure/servicebusqueues"
 	"github.com/dapr/components-contrib/bindings/azure/signalr"
 	"github.com/dapr/components-contrib/bindings/azure/storagequeues"
+	"github.com/dapr/components-contrib/bindings/commercetools"
 	"github.com/dapr/components-contrib/bindings/cron"
 	"github.com/dapr/components-contrib/bindings/gcp/bucket"
 	"github.com/dapr/components-contrib/bindings/gcp/pubsub"
@@ -386,6 +387,9 @@ func main() {
 			}),
 			bindings_loader.NewOutput("azure.storagequeues", func() bindings.OutputBinding {
 				return storagequeues.NewAzureStorageQueues(logContrib)
+			}),
+			bindings_loader.NewOutput("commercetools", func() bindings.OutputBinding {
+				return commercetools.NewCommercetools(logContrib)
 			}),
 			bindings_loader.NewOutput("cron", func() bindings.OutputBinding {
 				return cron.NewCron(logContrib)
