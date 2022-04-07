@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package utils
 
@@ -9,25 +17,25 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	guuid "github.com/google/uuid"
 )
 
-var (
-	doOnce        sync.Once
-	defaultClient http.Client
-)
+const (
+	// DefaultProbeTimeout is the a timeout used in HTTPGetNTimes() and
+	// HTTPGetRawNTimes() to avoid cases where early requests hang and
+	// block all subsequent requests.
+	DefaultProbeTimeout = 30 * time.Second
 
-// DefaultProbeTimeout is the a timeout used in HTTPGetNTimes() and
-// HTTPGetRawNTimes() to avoid cases where early requests hang and
-// block all subsequent requests.
-const DefaultProbeTimeout = 30 * time.Second
+	// Environment variable for setting the target OS where tests are running on.
+	TargetOsEnvVar = "TARGET_OS"
+)
 
 // SimpleKeyValue can be used to simplify code, providing simple key-value pairs.
 type SimpleKeyValue struct {
@@ -41,6 +49,8 @@ type StateTransactionKeyValue struct {
 	Value         string
 	OperationType string
 }
+
+var httpClient = newHTTPClient(0)
 
 // GenerateRandomStringKeys generates random string keys (values are nil).
 func GenerateRandomStringKeys(num int) []SimpleKeyValue {
@@ -75,21 +85,20 @@ func GenerateRandomStringKeyValues(num int) []SimpleKeyValue {
 	return GenerateRandomStringValues(keys)
 }
 
-func newHTTPClient() http.Client {
-	doOnce.Do(func() {
-		defaultClient = http.Client{
-			Timeout: time.Second * 15,
-			Transport: &http.Transport{
-				// Sometimes, the first connection to ingress endpoint takes longer than 1 minute (e.g. AKS)
-				Dial: (&net.Dialer{
-					Timeout:   5 * time.Minute,
-					KeepAlive: 6 * time.Minute,
-				}).Dial,
-			},
-		}
-	})
-
-	return defaultClient
+func newHTTPClient(t time.Duration) http.Client {
+	if t == 0 {
+		t = time.Second * 15
+	}
+	return http.Client{
+		Timeout: t,
+		Transport: &http.Transport{
+			// Sometimes, the first connection to ingress endpoint takes longer than 1 minute (e.g. AKS)
+			Dial: (&net.Dialer{
+				Timeout:   5 * time.Minute,
+				KeepAlive: 6 * time.Minute,
+			}).Dial,
+		},
+	}
 }
 
 // HTTPGetNTimes calls the url n times and returns the first success
@@ -159,9 +168,9 @@ func HTTPGetRawNTimes(url string, n int) (*http.Response, error) {
 
 // HTTPGetRaw is a helper to make GET request call to url.
 func httpGetRaw(url string, t time.Duration) (*http.Response, error) {
-	client := newHTTPClient()
+	client := httpClient
 	if t != 0 {
-		client.Timeout = t
+		client = newHTTPClient(t)
 	}
 	resp, err := client.Get(sanitizeHTTPURL(url))
 	if err != nil {
@@ -177,8 +186,22 @@ func HTTPGetRaw(url string) (*http.Response, error) {
 
 // HTTPPost is a helper to make POST request call to url.
 func HTTPPost(url string, data []byte) ([]byte, error) {
-	client := newHTTPClient()
-	resp, err := client.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
+	resp, err := httpClient.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
+	if err != nil {
+		return nil, err
+	}
+
+	return extractBody(resp.Body)
+}
+
+// HTTPPatch is a helper to make PATCH request call to url.
+func HTTPPatch(url string, data []byte) ([]byte, error) {
+	req, err := http.NewRequest("PATCH", sanitizeHTTPURL(url), bytes.NewBuffer(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req) //nolint
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +211,7 @@ func HTTPPost(url string, data []byte) ([]byte, error) {
 
 // HTTPPostWithStatus is a helper to make POST request call to url.
 func HTTPPostWithStatus(url string, data []byte) ([]byte, int, error) {
-	client := newHTTPClient()
-	resp, err := client.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
+	resp, err := httpClient.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
 	if err != nil {
 		// From the Do method for the client.Post
 		// An error is returned if caused by client policy (such as
@@ -209,14 +231,12 @@ func HTTPPostWithStatus(url string, data []byte) ([]byte, int, error) {
 
 // HTTPDelete calls a given URL with the HTTP DELETE method.
 func HTTPDelete(url string) ([]byte, error) {
-	client := newHTTPClient()
-
 	req, err := http.NewRequest("DELETE", sanitizeHTTPURL(url), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	res, err := client.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -243,10 +263,20 @@ func extractBody(r io.ReadCloser) ([]byte, error) {
 		defer r.Close()
 	}
 
-	body, err := ioutil.ReadAll(r)
+	body, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
 
 	return body, nil
+}
+
+// TestTargetOS returns the name of the OS that the tests are targeting (which could be different from the local OS).
+func TestTargetOS() string {
+	// Check if we have an env var first
+	if v, ok := os.LookupEnv(TargetOsEnvVar); ok {
+		return v
+	}
+	// Fallback to the runtime
+	return runtime.GOOS
 }

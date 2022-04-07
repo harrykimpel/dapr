@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package placement
 
@@ -299,9 +307,11 @@ func (p *Service) performTableDissemination() {
 func (p *Service) performTablesUpdate(hosts []placementGRPCStream, newTable *v1pb.PlacementTables) {
 	// TODO: error from disseminationOperation needs to be handle properly.
 	// Otherwise, each Dapr runtime will have inconsistent hashing table.
-	p.disseminateOperation(hosts, "lock", nil)
-	p.disseminateOperation(hosts, "update", newTable)
-	p.disseminateOperation(hosts, "unlock", nil)
+	for _, host := range hosts {
+		p.disseminateOperation([]placementGRPCStream{host}, "lock", nil)
+		p.disseminateOperation([]placementGRPCStream{host}, "update", newTable)
+		p.disseminateOperation([]placementGRPCStream{host}, "unlock", nil)
+	}
 }
 
 func (p *Service) disseminateOperation(targets []placementGRPCStream, operation string, tables *v1pb.PlacementTables) error {
@@ -309,17 +319,14 @@ func (p *Service) disseminateOperation(targets []placementGRPCStream, operation 
 		Operation: operation,
 		Tables:    tables,
 	}
-
 	var err error
 	for _, s := range targets {
 		config := retry.DefaultConfig()
 		config.MaxRetries = 3
 		backoff := config.NewBackOff()
-
 		retry.NotifyRecover(
 			func() error {
 				err = s.Send(o)
-
 				if err != nil {
 					remoteAddr := "n/a"
 					if peer, ok := peer.FromContext(s.Context()); ok {

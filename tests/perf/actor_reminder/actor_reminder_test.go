@@ -1,9 +1,18 @@
+//go:build perf
 // +build perf
 
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package actor_reminder_perf
 
@@ -73,6 +82,7 @@ func TestMain(m *testing.M) {
 
 func TestActorReminderRegistrationPerformance(t *testing.T) {
 	p := perf.Params()
+
 	// Get the ingress external url of test app
 	testAppURL := tr.Platform.AcquireAppExternalURL("testapp")
 	require.NotEmpty(t, testAppURL, "test app external URL must not be empty")
@@ -147,6 +157,5 @@ func TestActorReminderRegistrationPerformance(t *testing.T) {
 	require.Equal(t, 0, daprResult.RetCodes.Num400)
 	require.Equal(t, 0, daprResult.RetCodes.Num500)
 	require.Equal(t, 0, restarts)
-	// ActualQPS is at 60 right now. TODO: improve it to 90% of p.QPS.
-	require.True(t, daprResult.ActualQPS > 59)
+	require.True(t, daprResult.ActualQPS > 57)
 }

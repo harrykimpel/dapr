@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -12,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
@@ -38,6 +47,11 @@ type testCommandRequest struct {
 type indexHandlerResponse struct {
 	Message string `json:"message,omitempty"`
 }
+
+var (
+	grpcConn   *grpc.ClientConn
+	daprClient runtimev1pb.DaprClient
+)
 
 // indexHandler is the handler for root path
 func indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -95,16 +109,6 @@ func sendGRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := grpc.Dial(fmt.Sprintf("localhost:%d", daprPortGRPC), grpc.WithInsecure())
-	if err != nil {
-		log.Printf("Could not make dapr client: %s", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer conn.Close()
-
-	client := runtimev1pb.NewDaprClient(conn)
-
 	for _, message := range requestBody.Messages {
 		body, _ := json.Marshal(&message)
 
@@ -115,7 +119,7 @@ func sendGRPC(w http.ResponseWriter, r *http.Request) {
 			Operation: "create",
 		}
 
-		_, err = client.InvokeBinding(context.Background(), &req)
+		_, err = daprClient.InvokeBinding(context.Background(), &req)
 		if err != nil {
 			log.Printf("Error sending request to GRPC output binding: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -128,16 +132,6 @@ func sendGRPC(w http.ResponseWriter, r *http.Request) {
 func getReceivedTopicsGRPC(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Entered getReceivedTopicsGRPC")
 
-	conn, err := grpc.Dial(fmt.Sprintf("localhost:%d", daprPortGRPC), grpc.WithInsecure())
-	if err != nil {
-		log.Printf("Could not make dapr client: %s", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer conn.Close()
-
-	client := runtimev1pb.NewDaprClient(conn)
-
 	req := runtimev1pb.InvokeServiceRequest{
 		Id: "bindinginputgrpc",
 		Message: &commonv1pb.InvokeRequest{
@@ -149,7 +143,7 @@ func getReceivedTopicsGRPC(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	resp, err := client.InvokeService(context.Background(), &req)
+	resp, err := daprClient.InvokeService(context.Background(), &req)
 	if err != nil {
 		log.Printf("Could not get received messages: %s", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -172,7 +166,31 @@ func appRouter() *mux.Router {
 	return router
 }
 
+func initGRPCClient() {
+	url := fmt.Sprintf("localhost:%d", 50001)
+	log.Printf("Connecting to dapr using url %s", url)
+	for retries := 10; retries > 0; retries-- {
+		var err error
+		grpcConn, err = grpc.Dial(url, grpc.WithInsecure())
+		if err == nil {
+			break
+		}
+
+		if retries == 0 {
+			log.Printf("Could not connect to dapr: %v", err)
+			log.Panic(err)
+		}
+
+		log.Printf("Could not connect to dapr: %v, retrying...", err)
+		time.Sleep(5 * time.Second)
+	}
+
+	daprClient = runtimev1pb.NewDaprClient(grpcConn)
+}
+
 func main() {
+	initGRPCClient()
+
 	log.Printf("Hello Dapr - listening on http://localhost:%d", appPort)
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", appPort), appRouter()))

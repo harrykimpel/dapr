@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package http
 
@@ -10,6 +18,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	nethttp "net/http"
@@ -52,7 +61,7 @@ type Channel struct {
 
 // CreateLocalChannel creates an HTTP AppChannel
 // nolint:gosec
-func CreateLocalChannel(port, maxConcurrency int, spec config.TracingSpec, sslEnabled bool, maxRequestBodySize int) (channel.AppChannel, error) {
+func CreateLocalChannel(port, maxConcurrency int, spec config.TracingSpec, sslEnabled bool, maxRequestBodySize int, readBufferSize int) (channel.AppChannel, error) {
 	scheme := httpScheme
 	if sslEnabled {
 		scheme = httpsScheme
@@ -62,6 +71,9 @@ func CreateLocalChannel(port, maxConcurrency int, spec config.TracingSpec, sslEn
 		client: &fasthttp.Client{
 			MaxConnsPerHost:           1000000,
 			MaxIdemponentCallAttempts: 0,
+			MaxResponseBodySize:       maxRequestBodySize * 1024 * 1024,
+			ReadBufferSize:            readBufferSize * 1024,
+			DisablePathNormalizing:    true,
 		},
 		baseAddress:         fmt.Sprintf("%s://%s:%d", scheme, channel.DefaultChannelAddress, port),
 		tracingSpec:         spec,
@@ -106,9 +118,23 @@ func (h *Channel) GetAppConfig() (*config.ApplicationConfig, error) {
 		return &config, nil
 	}
 
-	_, body := resp.RawData()
-	if err = h.json.Unmarshal(body, &config); err != nil {
-		return nil, err
+	// Get versioning info, currently only v1 is supported.
+	headers := resp.Headers()
+	var version string
+	if val, ok := headers["dapr-app-config-version"]; ok {
+		if len(val.Values) == 1 {
+			version = val.Values[0]
+		}
+	}
+
+	switch version {
+	case "v1":
+		fallthrough
+	default:
+		_, body := resp.RawData()
+		if err = h.json.Unmarshal(body, &config); err != nil {
+			return nil, err
+		}
 	}
 
 	return &config, nil
@@ -180,8 +206,15 @@ func (h *Channel) constructRequest(ctx context.Context, req *invokev1.InvokeMeth
 	channelReq := fasthttp.AcquireRequest()
 
 	// Construct app channel URI: VERB http://localhost:3000/method?query1=value1
-	uri := fmt.Sprintf("%s/%s", h.baseAddress, req.Message().GetMethod())
-	channelReq.SetRequestURI(uri)
+	var uri string
+	method := req.Message().GetMethod()
+	if strings.HasPrefix(method, "/") {
+		uri = fmt.Sprintf("%s%s", h.baseAddress, method)
+	} else {
+		uri = fmt.Sprintf("%s/%s", h.baseAddress, method)
+	}
+	channelReq.URI().Update(uri)
+	channelReq.URI().DisablePathNormalizing = true
 	channelReq.URI().SetQueryString(req.EncodeHTTPQueryString())
 	channelReq.Header.SetMethod(req.Message().HttpExtension.Verb.String())
 

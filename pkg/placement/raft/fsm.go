@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package raft
 
@@ -13,6 +21,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/pkg/errors"
 
+	"github.com/dapr/dapr/pkg/placement/hashing"
 	v1pb "github.com/dapr/dapr/pkg/proto/placement/v1"
 )
 
@@ -70,29 +79,32 @@ func (c *FSM) PlacementState() *v1pb.PlacementTables {
 
 	entries := c.state.hashingTableMap()
 	for k, v := range entries {
-		hosts, sortedSet, loadMap, totalLoad := v.GetInternals()
-		table := v1pb.PlacementTable{
-			Hosts:     make(map[uint64]string),
-			SortedSet: make([]uint64, len(sortedSet)),
-			TotalLoad: totalLoad,
-			LoadMap:   make(map[string]*v1pb.Host),
-		}
-
-		for lk, lv := range hosts {
-			table.Hosts[lk] = lv
-		}
-
-		copy(table.SortedSet, sortedSet)
-
-		for lk, lv := range loadMap {
-			h := v1pb.Host{
-				Name: lv.Name,
-				Load: lv.Load,
-				Port: lv.Port,
-				Id:   lv.AppID,
+		var table v1pb.PlacementTable
+		v.ReadInternals(func(hosts map[uint64]string, sortedSet []uint64, loadMap map[string]*hashing.Host, totalLoad int64) {
+			table = v1pb.PlacementTable{
+				Hosts:     make(map[uint64]string),
+				SortedSet: make([]uint64, len(sortedSet)),
+				TotalLoad: totalLoad,
+				LoadMap:   make(map[string]*v1pb.Host),
 			}
-			table.LoadMap[lk] = &h
-		}
+
+			for lk, lv := range hosts {
+				table.Hosts[lk] = lv
+			}
+
+			copy(table.SortedSet, sortedSet)
+
+			for lk, lv := range loadMap {
+				h := v1pb.Host{
+					Name: lv.Name,
+					Load: lv.Load,
+					Port: lv.Port,
+					Id:   lv.AppID,
+				}
+				table.LoadMap[lk] = &h
+			}
+		})
+
 		newTable.Entries[k] = &table
 
 		totalHostSize += len(table.Hosts)

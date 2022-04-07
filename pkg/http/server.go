@@ -1,12 +1,21 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package http
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +24,7 @@ import (
 
 	cors "github.com/AdhityaRamadhanus/fasthttpcors"
 	routing "github.com/fasthttp/router"
+	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/pprofhandler"
@@ -34,6 +44,7 @@ const protocol = "http"
 
 // Server is an interface for the Dapr HTTP server.
 type Server interface {
+	io.Closer
 	StartNonBlocking() error
 }
 
@@ -44,7 +55,7 @@ type server struct {
 	pipeline           http_middleware.Pipeline
 	api                API
 	apiSpec            config.APISpec
-	listeners          []net.Listener
+	servers            []*fasthttp.Server
 	profilingListeners []net.Listener
 }
 
@@ -71,15 +82,18 @@ func (s *server) StartNonBlocking() error {
 	handler = s.useMetrics(handler)
 	handler = s.useTracing(handler)
 
-	customServer := &fasthttp.Server{
-		Handler:            handler,
-		MaxRequestBodySize: s.config.MaxRequestBodySize * 1024 * 1024,
+	apiLogLevel := s.config.APILoglevel
+
+	if strings.EqualFold(apiLogLevel, "info") {
+		handler = s.apiLoggingInfo(handler)
+	} else if strings.EqualFold(apiLogLevel, "debug") {
+		handler = s.apiLoggingDebug(handler)
 	}
 
 	var listeners []net.Listener
 	var profilingListeners []net.Listener
 	if s.config.UnixDomainSocket != "" {
-		socket := fmt.Sprintf("/%s/dapr-%s-http.socket", s.config.UnixDomainSocket, s.config.AppID)
+		socket := fmt.Sprintf("%s/dapr-%s-http.socket", s.config.UnixDomainSocket, s.config.AppID)
 		l, err := net.Listen("unix", socket)
 		if err != nil {
 			return err
@@ -99,10 +113,21 @@ func (s *server) StartNonBlocking() error {
 		return errors.Errorf("could not listen on any endpoint")
 	}
 
-	s.listeners = listeners
 	for _, listener := range listeners {
+		// customServer is created in a loop because each instance
+		// has a handle on the underlying listener.
+		customServer := &fasthttp.Server{
+			Handler:            handler,
+			MaxRequestBodySize: s.config.MaxRequestBodySize * 1024 * 1024,
+			ReadBufferSize:     s.config.ReadBufferSize * 1024,
+			StreamRequestBody:  s.config.StreamRequestBody,
+		}
+		s.servers = append(s.servers, customServer)
+
 		go func(l net.Listener) {
-			log.Fatal(customServer.Serve(l))
+			if err := customServer.Serve(l); err != nil {
+				log.Fatal(err)
+			}
 		}(listener)
 	}
 
@@ -115,9 +140,12 @@ func (s *server) StartNonBlocking() error {
 			Handler:            publicHandler,
 			MaxRequestBodySize: s.config.MaxRequestBodySize * 1024 * 1024,
 		}
+		s.servers = append(s.servers, healthServer)
 
 		go func() {
-			log.Fatal(healthServer.ListenAndServe(fmt.Sprintf(":%d", *s.config.PublicPort)))
+			if err := healthServer.ListenAndServe(fmt.Sprintf(":%d", *s.config.PublicPort)); err != nil {
+				log.Fatal(err)
+			}
 		}()
 	}
 
@@ -138,13 +166,36 @@ func (s *server) StartNonBlocking() error {
 
 		s.profilingListeners = profilingListeners
 		for _, listener := range profilingListeners {
+			// profServer is created in a loop because each instance
+			// has a handle on the underlying listener.
+			profServer := &fasthttp.Server{
+				Handler:            pprofhandler.PprofHandler,
+				MaxRequestBodySize: s.config.MaxRequestBodySize * 1024 * 1024,
+			}
+			s.servers = append(s.servers, profServer)
+
 			go func(l net.Listener) {
-				log.Fatal(fasthttp.Serve(l, pprofhandler.PprofHandler))
+				if err := profServer.Serve(l); err != nil {
+					log.Fatal(err)
+				}
 			}(listener)
 		}
 	}
 
 	return nil
+}
+
+func (s *server) Close() error {
+	var merr error
+
+	for _, ln := range s.servers {
+		// This calls `Close()` on the underlying listener.
+		if err := ln.Shutdown(); err != nil {
+			merr = multierror.Append(merr, err)
+		}
+	}
+
+	return merr
 }
 
 func (s *server) useTracing(next fasthttp.RequestHandler) fasthttp.RequestHandler {
@@ -163,6 +214,20 @@ func (s *server) useMetrics(next fasthttp.RequestHandler) fasthttp.RequestHandle
 	}
 
 	return next
+}
+
+func (s *server) apiLoggingInfo(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+	return func(ctx *fasthttp.RequestCtx) {
+		log.Infof("HTTP API Called: %s %s", ctx.Method(), ctx.Path())
+		next(ctx)
+	}
+}
+
+func (s *server) apiLoggingDebug(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+	return func(ctx *fasthttp.RequestCtx) {
+		log.Debugf("HTTP API Called: %s %s", ctx.Method(), ctx.Path())
+		next(ctx)
+	}
 }
 
 func (s *server) useRouter() fasthttp.RequestHandler {
@@ -270,7 +335,7 @@ func (s *server) getRouter(endpoints []Endpoint) *routing.Router {
 func (s *server) handle(e Endpoint, parameterFinder *regexp.Regexp, path string, router *routing.Router) {
 	for _, m := range e.Methods {
 		pathIncludesParameters := parameterFinder.MatchString(path)
-		if pathIncludesParameters {
+		if pathIncludesParameters && !e.KeepParamUnescape {
 			router.Handle(m, path, s.unescapeRequestParametersHandler(e.Handler))
 		} else {
 			router.Handle(m, path, e.Handler)

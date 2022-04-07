@@ -1,14 +1,22 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package injector
 
 import (
 	"bytes"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -221,7 +229,7 @@ func TestGetContainer(t *testing.T) {
 	annotations[daprConfigKey] = "config"
 	annotations[daprAppPortKey] = appPort
 
-	c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, "", "", "", "", false, "")
+	c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 
 	assert.NotNil(t, c)
 	assert.Equal(t, "image", c.Image)
@@ -236,7 +244,7 @@ func TestSidecarResourceLimits(t *testing.T) {
 		annotations[daprCPULimitKey] = "100m"
 		annotations[daprMemoryLimitKey] = "1Gi"
 
-		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, "", "", "", "", false, "")
+		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 		assert.NotNil(t, c)
 		assert.Equal(t, "100m", c.Resources.Limits.Cpu().String())
 		assert.Equal(t, "1Gi", c.Resources.Limits.Memory().String())
@@ -250,7 +258,7 @@ func TestSidecarResourceLimits(t *testing.T) {
 		annotations[daprCPURequestKey] = "100m"
 		annotations[daprMemoryRequestKey] = "1Gi"
 
-		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, "", "", "", "", false, "")
+		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 		assert.NotNil(t, c)
 		assert.Equal(t, "100m", c.Resources.Requests.Cpu().String())
 		assert.Equal(t, "1Gi", c.Resources.Requests.Memory().String())
@@ -262,7 +270,7 @@ func TestSidecarResourceLimits(t *testing.T) {
 		annotations[daprAppPortKey] = appPort
 		annotations[daprLogAsJSON] = "true"
 
-		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, "", "", "", "", false, "")
+		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 		assert.NotNil(t, c)
 		assert.Len(t, c.Resources.Limits, 0)
 	})
@@ -396,7 +404,7 @@ func TestAppSSL(t *testing.T) {
 		annotations := map[string]string{
 			daprAppSSLKey: "true",
 		}
-		c, _ := getSidecarContainer(annotations, "app", "image", "", "ns", "a", "b", nil, "", "", "", "", false, "")
+		c, _ := getSidecarContainer(annotations, "app", "image", "", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 		found := false
 		for _, a := range c.Args {
 			if a == "--app-ssl" {
@@ -411,7 +419,7 @@ func TestAppSSL(t *testing.T) {
 		annotations := map[string]string{
 			daprAppSSLKey: "false",
 		}
-		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, "", "", "", "", false, "")
+		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 		for _, a := range c.Args {
 			if a == "--app-ssl" {
 				t.FailNow()
@@ -421,7 +429,7 @@ func TestAppSSL(t *testing.T) {
 
 	t.Run("get sidecar container not specified", func(t *testing.T) {
 		annotations := map[string]string{}
-		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, "", "", "", "", false, "")
+		c, _ := getSidecarContainer(annotations, "app", "image", "Always", "ns", "a", "b", nil, nil, "", "", "", "", false, "")
 		for _, a := range c.Args {
 			if a == "--app-ssl" {
 				t.FailNow()
@@ -615,7 +623,7 @@ func TestHandleRequest(t *testing.T) {
 			assert.Equal(t, tc.expectStatusCode, resp.StatusCode)
 
 			if resp.StatusCode == http.StatusOK {
-				body, err := ioutil.ReadAll(resp.Body)
+				body, err := io.ReadAll(resp.Body)
 				assert.NoError(t, err)
 
 				var ar v1.AdmissionReview

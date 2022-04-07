@@ -1,19 +1,29 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package runtime
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strconv"
@@ -45,8 +55,10 @@ import (
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/components-contrib/state"
+	"github.com/dapr/kit/logger"
 
 	components_v1alpha1 "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
+	"github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
 	subscriptionsapi "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
 	channelt "github.com/dapr/dapr/pkg/channel/testing"
 	bindings_loader "github.com/dapr/dapr/pkg/components/bindings"
@@ -63,6 +75,7 @@ import (
 	"github.com/dapr/dapr/pkg/modes"
 	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+	"github.com/dapr/dapr/pkg/resiliency"
 	runtime_pubsub "github.com/dapr/dapr/pkg/runtime/pubsub"
 	"github.com/dapr/dapr/pkg/runtime/security"
 	"github.com/dapr/dapr/pkg/scopes"
@@ -92,6 +105,50 @@ Iklq0JnMgJU7nS+VpVvlgBN8
 
 	testInputBindingData = []byte("fakedata")
 )
+
+var testResiliency = &v1alpha1.Resiliency{
+	Spec: v1alpha1.ResiliencySpec{
+		Policies: v1alpha1.Policies{
+			Retries: map[string]v1alpha1.Retry{
+				"singleRetry": {
+					MaxRetries:  1,
+					MaxInterval: "100ms",
+					Policy:      "constant",
+					Duration:    "10ms",
+				},
+			},
+			Timeouts: map[string]string{
+				"fast": "100ms",
+			},
+		},
+		Targets: v1alpha1.Targets{
+			Components: map[string]v1alpha1.ComponentPolicyNames{
+				"failOutput": {
+					Outbound: v1alpha1.PolicyNames{
+						Retry:   "singleRetry",
+						Timeout: "fast",
+					},
+				},
+				"failPubsub": {
+					Outbound: v1alpha1.PolicyNames{
+						Retry:   "singleRetry",
+						Timeout: "fast",
+					},
+					Inbound: v1alpha1.PolicyNames{
+						Retry:   "singleRetry",
+						Timeout: "fast",
+					},
+				},
+				"failingInputBinding": {
+					Inbound: v1alpha1.PolicyNames{
+						Retry:   "singleRetry",
+						Timeout: "fast",
+					},
+				},
+			},
+		},
+	},
+}
 
 type MockKubernetesStateStore struct {
 	callback func()
@@ -140,7 +197,7 @@ func NewMockKubernetesStoreWithInitCallback(cb func()) secretstores.SecretStore 
 
 func TestNewRuntime(t *testing.T) {
 	// act
-	r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{})
+	r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 
 	// assert
 	assert.NotNil(t, r, "runtime must be initiated")
@@ -205,7 +262,7 @@ func testDeclarativeSubscription() subscriptionsapi.Subscription {
 
 func writeSubscriptionToDisk(subscription subscriptionsapi.Subscription, filePath string) {
 	b, _ := yaml.Marshal(subscription)
-	ioutil.WriteFile(filePath, b, 0600)
+	os.WriteFile(filePath, b, 0600)
 }
 
 func TestProcessComponentsAndDependents(t *testing.T) {
@@ -603,12 +660,6 @@ func TestInitState(t *testing.T) {
 		// setup
 		initMockStateStoreForRuntime(rt, nil)
 
-		// act
-		rt.globalConfig.Spec.Features = append(rt.globalConfig.Spec.Features, config.FeatureSpec{
-			Name:    config.StateEncryption,
-			Enabled: true,
-		})
-
 		rt.secretStores["mockSecretStore"] = &mockSecretStore{}
 
 		err := rt.initState(mockStateComponent)
@@ -850,6 +901,106 @@ func TestMetadataUUID(t *testing.T) {
 
 	err := rt.processComponentAndDependents(pubsubComponent)
 	assert.Nil(t, err)
+}
+
+func TestOnComponentUpdated(t *testing.T) {
+	t.Run("component spec changed, component is updated", func(t *testing.T) {
+		rt := NewTestDaprRuntime(modes.KubernetesMode)
+		rt.components = append(rt.components, components_v1alpha1.Component{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name: "test",
+			},
+			Spec: components_v1alpha1.ComponentSpec{
+				Type:    "pubsub.mockPubSub",
+				Version: "v1",
+				Metadata: []components_v1alpha1.MetadataItem{
+					{
+						Name: "name1",
+						Value: components_v1alpha1.DynamicValue{
+							JSON: v1.JSON{
+								Raw: []byte("value1"),
+							},
+						},
+					},
+				},
+			},
+		})
+
+		go func() {
+			<-rt.pendingComponents
+		}()
+
+		updated := rt.onComponentUpdated(components_v1alpha1.Component{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name: "test",
+			},
+			Spec: components_v1alpha1.ComponentSpec{
+				Type:    "pubsub.mockPubSub",
+				Version: "v1",
+				Metadata: []components_v1alpha1.MetadataItem{
+					{
+						Name: "name1",
+						Value: components_v1alpha1.DynamicValue{
+							JSON: v1.JSON{
+								Raw: []byte("value2"),
+							},
+						},
+					},
+				},
+			},
+		})
+
+		assert.True(t, updated)
+	})
+
+	t.Run("component spec unchanged, component is skipped", func(t *testing.T) {
+		rt := NewTestDaprRuntime(modes.KubernetesMode)
+		rt.components = append(rt.components, components_v1alpha1.Component{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name: "test",
+			},
+			Spec: components_v1alpha1.ComponentSpec{
+				Type:    "pubsub.mockPubSub",
+				Version: "v1",
+				Metadata: []components_v1alpha1.MetadataItem{
+					{
+						Name: "name1",
+						Value: components_v1alpha1.DynamicValue{
+							JSON: v1.JSON{
+								Raw: []byte("value1"),
+							},
+						},
+					},
+				},
+			},
+		})
+
+		go func() {
+			<-rt.pendingComponents
+		}()
+
+		updated := rt.onComponentUpdated(components_v1alpha1.Component{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name: "test",
+			},
+			Spec: components_v1alpha1.ComponentSpec{
+				Type:    "pubsub.mockPubSub",
+				Version: "v1",
+				Metadata: []components_v1alpha1.MetadataItem{
+					{
+						Name: "name1",
+						Value: components_v1alpha1.DynamicValue{
+							JSON: v1.JSON{
+								Raw: []byte("value1"),
+							},
+						},
+					},
+				},
+			},
+		})
+
+		assert.False(t, updated)
+	})
 }
 
 func TestConsumerID(t *testing.T) {
@@ -1912,6 +2063,7 @@ func TestErrorPublishedNonCloudEventHTTP(t *testing.T) {
 	fakeReq := invokev1.NewInvokeMethodRequest(testPubSubMessage.topic)
 	fakeReq.WithHTTPExtension(http.MethodPost, "")
 	fakeReq.WithRawData(testPubSubMessage.data, contenttype.CloudEventContentType)
+	fakeReq.WithCustomHTTPMetadata(testPubSubMessage.metadata)
 
 	rt := NewTestDaprRuntime(modes.StandaloneMode)
 	defer stopRuntime(t, rt)
@@ -2093,7 +2245,8 @@ func TestErrorPublishedNonCloudEventGRPC(t *testing.T) {
 func TestOnNewPublishedMessage(t *testing.T) {
 	topic := "topic1"
 
-	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "", []byte("Test Message"), "")
+	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic,
+		TestSecondPubsubName, "", []byte("Test Message"), "", "")
 	b, err := json.Marshal(envelope)
 	assert.Nil(t, err)
 
@@ -2108,6 +2261,7 @@ func TestOnNewPublishedMessage(t *testing.T) {
 	fakeReq := invokev1.NewInvokeMethodRequest(testPubSubMessage.topic)
 	fakeReq.WithHTTPExtension(http.MethodPost, "")
 	fakeReq.WithRawData(testPubSubMessage.data, contenttype.CloudEventContentType)
+	fakeReq.WithCustomHTTPMetadata(testPubSubMessage.metadata)
 
 	rt := NewTestDaprRuntime(modes.StandaloneMode)
 	defer stopRuntime(t, rt)
@@ -2141,7 +2295,8 @@ func TestOnNewPublishedMessage(t *testing.T) {
 
 		// Generate a new envelope to avoid affecting other tests by modifying shared `envelope`
 		envelopeNoTraceID := pubsub.NewCloudEventsEnvelope(
-			"", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "", []byte("Test Message"), "")
+			"", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "",
+			[]byte("Test Message"), "", "")
 		delete(envelopeNoTraceID, pubsub.TraceIDField)
 		bNoTraceID, err := json.Marshal(envelopeNoTraceID)
 		assert.Nil(t, err)
@@ -2157,6 +2312,7 @@ func TestOnNewPublishedMessage(t *testing.T) {
 		fakeReqNoTraceID := invokev1.NewInvokeMethodRequest(message.topic)
 		fakeReqNoTraceID.WithHTTPExtension(http.MethodPost, "")
 		fakeReqNoTraceID.WithRawData(message.data, contenttype.CloudEventContentType)
+		fakeReqNoTraceID.WithCustomHTTPMetadata(testPubSubMessage.metadata)
 		mockAppChannel.On("InvokeMethod", mock.AnythingOfType("*context.emptyCtx"), fakeReqNoTraceID).Return(fakeResp, nil)
 
 		// act
@@ -2357,7 +2513,8 @@ func TestOnNewPublishedMessage(t *testing.T) {
 func TestOnNewPublishedMessageGRPC(t *testing.T) {
 	topic := "topic1"
 
-	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "", []byte("Test Message"), "")
+	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic,
+		TestSecondPubsubName, "", []byte("Test Message"), "", "")
 	b, err := json.Marshal(envelope)
 	assert.Nil(t, err)
 
@@ -2369,7 +2526,8 @@ func TestOnNewPublishedMessageGRPC(t *testing.T) {
 		path:       "topic1",
 	}
 
-	envelope = pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "application/octet-stream", []byte{0x1}, "")
+	envelope = pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic,
+		TestSecondPubsubName, "application/octet-stream", []byte{0x1}, "", "")
 	base64, err := json.Marshal(envelope)
 	assert.Nil(t, err)
 
@@ -2483,6 +2641,128 @@ func TestOnNewPublishedMessageGRPC(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPubsubWithResiliency(t *testing.T) {
+	r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{}, resiliency.FromConfigurations(logger.NewLogger("test"), testResiliency))
+	defer stopRuntime(t, r)
+
+	failingPubsub := daprt.FailingPubsub{
+		Failure: daprt.Failure{
+			Fails: map[string]int{
+				"failingTopic": 1,
+			},
+			Timeouts: map[string]time.Duration{
+				"timeoutTopic": time.Second * 10,
+			},
+			CallCount: map[string]int{},
+		},
+	}
+
+	failingAppChannel := daprt.FailingAppChannel{
+		Failure: daprt.Failure{
+			Fails: map[string]int{
+				"failingSubTopic": 1,
+			},
+			Timeouts: map[string]time.Duration{
+				"timeoutSubTopic": time.Second * 10,
+			},
+			CallCount: map[string]int{},
+		},
+		KeyFunc: func(req *invokev1.InvokeMethodRequest) string {
+			rawData := req.Message().Data.Value
+			data := make(map[string]string)
+			json.Unmarshal(rawData, &data)
+			val, _ := base64.StdEncoding.DecodeString(data["data_base64"])
+			return string(val)
+		},
+	}
+
+	r.pubSubRegistry.Register(pubsub_loader.New(
+		"failingPubsub", func() pubsub.PubSub { return &failingPubsub },
+	))
+
+	component := components_v1alpha1.Component{}
+	component.ObjectMeta.Name = "failPubsub"
+	component.Spec.Type = "pubsub.failingPubsub"
+
+	err := r.initPubSub(component)
+	assert.NoError(t, err)
+
+	t.Run("pubsub publish retries with resiliency", func(t *testing.T) {
+		req := &pubsub.PublishRequest{
+			PubsubName: "failPubsub",
+			Topic:      "failingTopic",
+		}
+		err := r.Publish(req)
+
+		assert.NoError(t, err)
+		assert.Equal(t, 2, failingPubsub.Failure.CallCount["failingTopic"])
+	})
+
+	t.Run("pubsub publish times out with resiliency", func(t *testing.T) {
+		req := &pubsub.PublishRequest{
+			PubsubName: "failPubsub",
+			Topic:      "timeoutTopic",
+		}
+
+		start := time.Now()
+		err := r.Publish(req)
+		end := time.Now()
+
+		assert.Error(t, err)
+		assert.Equal(t, 2, failingPubsub.Failure.CallCount["timeoutTopic"])
+		assert.Less(t, end.Sub(start), time.Second*10)
+	})
+
+	r.runtimeConfig.ApplicationProtocol = HTTPProtocol
+	r.appChannel = &failingAppChannel
+
+	t.Run("pubsub retries subscription event with resiliency", func(t *testing.T) {
+		r.topicRoutes = make(map[string]TopicRoute)
+		r.topicRoutes["failPubsub"] = TopicRoute{routes: map[string]Route{
+			"failingSubTopic": {
+				metadata: map[string]string{
+					"rawPayload": "true",
+				},
+				rules: []*runtime_pubsub.Rule{
+					{
+						Path: "failingPubsub",
+					},
+				},
+			},
+		}}
+
+		err := r.beginPubSub("failPubsub", &failingPubsub)
+
+		assert.NoError(t, err)
+		assert.Equal(t, 2, failingAppChannel.Failure.CallCount["failingSubTopic"])
+	})
+
+	t.Run("pubsub times out sending event to app with resiliency", func(t *testing.T) {
+		r.topicRoutes = make(map[string]TopicRoute)
+		r.topicRoutes["failPubsub"] = TopicRoute{routes: map[string]Route{
+			"timeoutSubTopic": {
+				metadata: map[string]string{
+					"rawPayload": "true",
+				},
+				rules: []*runtime_pubsub.Rule{
+					{
+						Path: "failingPubsub",
+					},
+				},
+			},
+		}}
+
+		start := time.Now()
+		err := r.beginPubSub("failPubsub", &failingPubsub)
+		end := time.Now()
+
+		// This is eaten, technically.
+		assert.NoError(t, err)
+		assert.Equal(t, 2, failingAppChannel.Failure.CallCount["timeoutSubTopic"])
+		assert.Less(t, end.Sub(start), time.Second*10)
+	})
 }
 
 func TestGetSubscribedBindingsGRPC(t *testing.T) {
@@ -2624,9 +2904,20 @@ func NewTestDaprRuntimeWithProtocol(mode modes.DaprMode, protocol string, appPor
 		-1,
 		false,
 		"",
-		false, 4, "")
+		false,
+		4,
+		"",
+		4,
+		false,
+		time.Second,
+		"info")
 
-	return NewDaprRuntime(testRuntimeConfig, &config.Configuration{}, &config.AccessControlList{})
+	return NewDaprRuntime(testRuntimeConfig, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	r := NewTestDaprRuntime(modes.StandaloneMode)
+	assert.Equal(t, time.Second, r.runtimeConfig.GracefulShutdownDuration)
 }
 
 func TestMTLS(t *testing.T) {
@@ -2639,7 +2930,11 @@ func TestMTLS(t *testing.T) {
 		os.Setenv(certs.TrustAnchorsEnvVar, testCertRoot)
 		os.Setenv(certs.CertChainEnvVar, "a")
 		os.Setenv(certs.CertKeyEnvVar, "b")
-		defer os.Clearenv()
+		defer func() {
+			os.Unsetenv(certs.TrustAnchorsEnvVar)
+			os.Unsetenv(certs.CertChainEnvVar)
+			os.Unsetenv(certs.CertKeyEnvVar)
+		}()
 
 		certChain, err := security.GetCertChain()
 		assert.Nil(t, err)
@@ -2860,13 +3155,34 @@ func TestNamespace(t *testing.T) {
 
 	t.Run("non-empty namespace", func(t *testing.T) {
 		os.Setenv("NAMESPACE", "a")
-		defer os.Clearenv()
+		defer os.Unsetenv("NAMESPACE")
 
 		rt := NewTestDaprRuntime(modes.StandaloneMode)
 		defer stopRuntime(t, rt)
 		ns := rt.getNamespace()
 
 		assert.Equal(t, "a", ns)
+	})
+}
+
+func TestPodName(t *testing.T) {
+	t.Run("empty podName", func(t *testing.T) {
+		rt := NewTestDaprRuntime(modes.StandaloneMode)
+		defer stopRuntime(t, rt)
+		podName := rt.getPodName()
+
+		assert.Empty(t, podName)
+	})
+
+	t.Run("non-empty podName", func(t *testing.T) {
+		os.Setenv("POD_NAME", "testPodName")
+		defer os.Unsetenv("POD_NAME")
+
+		rt := NewTestDaprRuntime(modes.StandaloneMode)
+		defer stopRuntime(t, rt)
+		podName := rt.getPodName()
+
+		assert.Equal(t, "testPodName", podName)
 	})
 }
 
@@ -2994,7 +3310,7 @@ func (m *mockPublishPubSub) Features() []pubsub.Feature {
 
 func TestInitActors(t *testing.T) {
 	t.Run("missing namespace on kubernetes", func(t *testing.T) {
-		r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{})
+		r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 		defer stopRuntime(t, r)
 		r.namespace = ""
 		r.runtimeConfig.mtlsEnabled = true
@@ -3004,28 +3320,28 @@ func TestInitActors(t *testing.T) {
 	})
 
 	t.Run("actors hosted = true", func(t *testing.T) {
-		r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{})
+		r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 		defer stopRuntime(t, r)
 		r.appConfig = config.ApplicationConfig{
 			Entities: []string{"actor1"},
 		}
 
-		hosted := r.hostingActors()
+		hosted := len(r.appConfig.Entities) > 0
 		assert.True(t, hosted)
 	})
 
 	t.Run("actors hosted = false", func(t *testing.T) {
-		r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{})
+		r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 		defer stopRuntime(t, r)
 
-		hosted := r.hostingActors()
+		hosted := len(r.appConfig.Entities) > 0
 		assert.False(t, hosted)
 	})
 }
 
 func TestInitBindings(t *testing.T) {
 	t.Run("single input binding", func(t *testing.T) {
-		r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{})
+		r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 		defer stopRuntime(t, r)
 		r.bindingsRegistry.RegisterInputBindings(
 			bindings_loader.NewInput("testInputBinding", func() bindings.InputBinding {
@@ -3041,7 +3357,7 @@ func TestInitBindings(t *testing.T) {
 	})
 
 	t.Run("single output binding", func(t *testing.T) {
-		r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{})
+		r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 		defer stopRuntime(t, r)
 		r.bindingsRegistry.RegisterOutputBindings(
 			bindings_loader.NewOutput("testOutputBinding", func() bindings.OutputBinding {
@@ -3057,7 +3373,7 @@ func TestInitBindings(t *testing.T) {
 	})
 
 	t.Run("one input binding, one output binding", func(t *testing.T) {
-		r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{})
+		r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 		defer stopRuntime(t, r)
 		r.bindingsRegistry.RegisterInputBindings(
 			bindings_loader.NewInput("testinput", func() bindings.InputBinding {
@@ -3082,6 +3398,95 @@ func TestInitBindings(t *testing.T) {
 		output.Spec.Type = "bindings.testoutput"
 		err = r.initBinding(output)
 		assert.NoError(t, err)
+	})
+}
+
+func TestBindingResiliency(t *testing.T) {
+	r := NewDaprRuntime(&Config{}, &config.Configuration{}, &config.AccessControlList{}, resiliency.FromConfigurations(logger.NewLogger("test"), testResiliency))
+	defer stopRuntime(t, r)
+
+	failingChannel := daprt.FailingAppChannel{
+		Failure: daprt.Failure{
+			Fails: map[string]int{
+				"inputFailingKey": 1,
+			},
+			Timeouts: map[string]time.Duration{
+				"inputTimeoutKey": time.Second * 10,
+			},
+			CallCount: map[string]int{},
+		},
+		KeyFunc: func(req *invokev1.InvokeMethodRequest) string {
+			return string(req.Message().Data.Value)
+		},
+	}
+
+	r.appChannel = &failingChannel
+	r.runtimeConfig.ApplicationProtocol = HTTPProtocol
+
+	failingBinding := daprt.FailingBinding{
+		Failure: daprt.Failure{
+			Fails: map[string]int{
+				"outputFailingKey": 1,
+			},
+			Timeouts: map[string]time.Duration{
+				"outputTimeoutKey": time.Second * 10,
+			},
+			CallCount: map[string]int{},
+		},
+	}
+
+	r.bindingsRegistry.RegisterOutputBindings(
+		bindings_loader.NewOutput("failingoutput", func() bindings.OutputBinding {
+			return &failingBinding
+		}),
+	)
+
+	output := components_v1alpha1.Component{}
+	output.ObjectMeta.Name = "failOutput"
+	output.Spec.Type = "bindings.failingoutput"
+	err := r.initBinding(output)
+	assert.NoError(t, err)
+
+	t.Run("output binding retries on failure with resiliency", func(t *testing.T) {
+		req := &bindings.InvokeRequest{
+			Data:      []byte("outputFailingKey"),
+			Operation: "create",
+		}
+		_, err := r.sendToOutputBinding("failOutput", req)
+
+		assert.Nil(t, err)
+		assert.Equal(t, 2, failingBinding.Failure.CallCount["outputFailingKey"])
+	})
+
+	t.Run("output binding times out with resiliency", func(t *testing.T) {
+		req := &bindings.InvokeRequest{
+			Data:      []byte("outputTimeoutKey"),
+			Operation: "create",
+		}
+		start := time.Now()
+		_, err := r.sendToOutputBinding("failOutput", req)
+		end := time.Now()
+
+		assert.NotNil(t, err)
+		assert.Equal(t, 2, failingBinding.Failure.CallCount["outputTimeoutKey"])
+		assert.Less(t, end.Sub(start), time.Second*10)
+	})
+
+	t.Run("input binding retries on failure with resiliency", func(t *testing.T) {
+		_, err := r.sendBindingEventToApp("failingInputBinding", []byte("inputFailingKey"), map[string]string{})
+
+		assert.NoError(t, err)
+		assert.Equal(t, 2, failingChannel.Failure.CallCount["inputFailingKey"])
+	})
+
+	t.Run("input binding times out with resiliency", func(t *testing.T) {
+		start := time.Now()
+		_, err := r.sendBindingEventToApp("failingInputBinding", []byte("inputTimeoutKey"), map[string]string{})
+		end := time.Now()
+
+		assert.Error(t, err)
+		assert.Equal(t, 2, failingChannel.Failure.CallCount["inputTimeoutKey"])
+		assert.Less(t, end.Sub(start), time.Second*10)
 	})
 }
 
@@ -3146,7 +3551,7 @@ func TestActorReentrancyConfig(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.Name, func(t *testing.T) {
-			r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{})
+			r := NewDaprRuntime(&Config{Mode: modes.KubernetesMode}, &config.Configuration{}, &config.AccessControlList{}, resiliency.New(logger.NewLogger("test")))
 
 			mockAppChannel := new(channelt.MockAppChannel)
 			r.appChannel = mockAppChannel
@@ -3369,10 +3774,8 @@ func stopRuntime(t *testing.T, rt *DaprRuntime) {
 func TestFindMatchingRoute(t *testing.T) {
 	r, err := createRoutingRule(`event.type == "MyEventType"`, "mypath")
 	require.NoError(t, err)
-	route := Route{
-		rules: []*runtime_pubsub.Rule{r},
-	}
-	path, shouldProcess, err := findMatchingRoute(&route, map[string]interface{}{
+	rules := []*runtime_pubsub.Rule{r}
+	path, shouldProcess, err := findMatchingRoute(rules, map[string]interface{}{
 		"type": "MyEventType",
 	}, true)
 	require.NoError(t, err)
@@ -3394,4 +3797,34 @@ func createRoutingRule(match, path string) (*runtime_pubsub.Rule, error) {
 		Match: e,
 		Path:  path,
 	}, nil
+}
+
+func TestComponentsCallback(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "OK")
+	}))
+	defer svr.Close()
+
+	u, err := url.Parse(svr.URL)
+	require.NoError(t, err)
+	port, _ := strconv.Atoi(u.Port())
+	rt := NewTestDaprRuntimeWithProtocol(modes.StandaloneMode, "http", port)
+	defer stopRuntime(t, rt)
+
+	c := make(chan struct{})
+	callbackInvoked := false
+
+	rt.Run(WithComponentsCallback(func(components ComponentRegistry) error {
+		close(c)
+		callbackInvoked = true
+
+		return nil
+	}))
+
+	select {
+	case <-c:
+	case <-time.After(10 * time.Second):
+	}
+
+	assert.True(t, callbackInvoked, "component callback was not invoked")
 }

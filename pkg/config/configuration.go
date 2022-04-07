@@ -1,14 +1,21 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package config
 
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
@@ -35,10 +42,9 @@ const (
 	SpiffeIDPrefix              = "spiffe://"
 	HTTPProtocol                = "http"
 	GRPCProtocol                = "grpc"
-	ActorRentrancy      Feature = "Actor.Reentrancy"
 	ActorTypeMetadata   Feature = "Actor.TypeMetadata"
 	PubSubRouting       Feature = "PubSub.Routing"
-	StateEncryption     Feature = "State.Encryption"
+	Resiliency          Feature = "Resiliency"
 )
 
 type Feature string
@@ -65,20 +71,20 @@ type AccessControlListPolicySpec struct {
 	DefaultAction       string
 	TrustDomain         string
 	Namespace           string
-	AppOperationActions map[string]AccessControlListOperationAction
+	AppOperationActions *Trie
 }
 
 // AccessControlListOperationAction is an in-memory access control list config per operation for fast lookup.
 type AccessControlListOperationAction struct {
-	VerbAction       map[string]string
-	OperationPostFix string
-	OperationAction  string
+	VerbAction      map[string]string
+	OperationName   string
+	OperationAction string
 }
 
 type ConfigurationSpec struct {
 	HTTPPipelineSpec   PipelineSpec       `json:"httpPipeline,omitempty" yaml:"httpPipeline,omitempty"`
 	TracingSpec        TracingSpec        `json:"tracing,omitempty" yaml:"tracing,omitempty"`
-	MTLSSpec           MTLSSpec           `json:"mtls,omitempty"`
+	MTLSSpec           MTLSSpec           `json:"mtls,omitempty" yaml:"mtls,omitempty"`
 	MetricSpec         MetricSpec         `json:"metric,omitempty" yaml:"metric,omitempty"`
 	Secrets            SecretsSpec        `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 	AccessControlSpec  AccessControlSpec  `json:"accessControl,omitempty" yaml:"accessControl,omitempty"`
@@ -177,9 +183,9 @@ type NameResolutionSpec struct {
 }
 
 type MTLSSpec struct {
-	Enabled          bool   `json:"enabled"`
-	WorkloadCertTTL  string `json:"workloadCertTTL"`
-	AllowedClockSkew string `json:"allowedClockSkew"`
+	Enabled          bool   `json:"enabled" yaml:"enabled"`
+	WorkloadCertTTL  string `json:"workloadCertTTL" yaml:"workloadCertTTL"`
+	AllowedClockSkew string `json:"allowedClockSkew" yaml:"allowedClockSkew"`
 }
 
 // SpiffeID represents the separated fields in a spiffe id.
@@ -220,7 +226,7 @@ func LoadStandaloneConfiguration(config string) (*Configuration, string, error) 
 		return nil, "", err
 	}
 
-	b, err := ioutil.ReadFile(config)
+	b, err := os.ReadFile(config)
 	if err != nil {
 		return nil, "", err
 	}
@@ -242,10 +248,11 @@ func LoadStandaloneConfiguration(config string) (*Configuration, string, error) 
 }
 
 // LoadKubernetesConfiguration gets configuration from the Kubernetes operator with a given name.
-func LoadKubernetesConfiguration(config, namespace string, operatorClient operatorv1pb.OperatorClient) (*Configuration, error) {
+func LoadKubernetesConfiguration(config, namespace string, podName string, operatorClient operatorv1pb.OperatorClient) (*Configuration, error) {
 	resp, err := operatorClient.GetConfiguration(context.Background(), &operatorv1pb.GetConfigurationRequest{
 		Name:      config,
 		Namespace: namespace,
+		PodName:   podName,
 	}, grpc_retry.WithMax(operatorMaxRetries), grpc_retry.WithPerRetryTimeout(operatorCallTimeout))
 	if err != nil {
 		return nil, err
@@ -267,7 +274,7 @@ func LoadKubernetesConfiguration(config, namespace string, operatorClient operat
 	return conf, nil
 }
 
-// Validate the secrets configuration and sort the allow and deny lists if present.
+// Validate the secrets configuration and sort to the allowed and denied lists if present.
 func sortAndValidateSecretsConfiguration(conf *Configuration) error {
 	scopes := conf.Spec.Secrets.Scopes
 	set := sets.NewString()
@@ -291,9 +298,9 @@ func sortAndValidateSecretsConfiguration(conf *Configuration) error {
 	return nil
 }
 
-// Check if the secret is allowed to be accessed.
+// IsSecretAllowed Check if the secret is allowed to be accessed.
 func (c SecretsScope) IsSecretAllowed(key string) bool {
-	// By default set allow access for the secret store.
+	// By default, set allow access for the secret store.
 	var access string = AllowAccess
 	// Check and set deny access.
 	if strings.EqualFold(c.DefaultAccess, DenyAccess) {

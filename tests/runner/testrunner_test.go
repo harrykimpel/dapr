@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package runner
 
@@ -12,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
+	configurationv1alpha1 "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 )
 
@@ -89,6 +98,11 @@ func (m *MockPlatform) GetSidecarUsage(appName string) (*AppUsage, error) {
 func (m *MockPlatform) GetTotalRestarts(appName string) (int, error) {
 	args := m.Called(appName)
 	return 0, args.Error(0)
+}
+
+func (m *MockPlatform) GetConfiguration(name string) (*configurationv1alpha1.Configuration, error) {
+	args := m.Called(name)
+	return &configurationv1alpha1.Configuration{}, args.Error(0)
 }
 
 func TestStartRunner(t *testing.T) {

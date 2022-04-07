@@ -1,14 +1,25 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package grpc
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +50,7 @@ const (
 
 // Server is an interface for the dapr gRPC server.
 type Server interface {
+	io.Closer
 	StartNonBlocking() error
 }
 
@@ -48,8 +60,7 @@ type server struct {
 	tracingSpec        config.TracingSpec
 	metricSpec         config.MetricSpec
 	authenticator      auth.Authenticator
-	listeners          []net.Listener
-	srv                *grpc_go.Server
+	servers            []*grpc_go.Server
 	renewMutex         *sync.Mutex
 	signedCert         *auth.SignedCertificate
 	tlsCert            tls.Certificate
@@ -107,7 +118,7 @@ func getDefaultMaxAgeDuration() *time.Duration {
 func (s *server) StartNonBlocking() error {
 	var listeners []net.Listener
 	if s.config.UnixDomainSocket != "" && s.kind == apiServer {
-		socket := fmt.Sprintf("/%s/dapr-%s-grpc.socket", s.config.UnixDomainSocket, s.config.AppID)
+		socket := fmt.Sprintf("%s/dapr-%s-grpc.socket", s.config.UnixDomainSocket, s.config.AppID)
 		l, err := net.Listen("unix", socket)
 		if err != nil {
 			return err
@@ -127,27 +138,37 @@ func (s *server) StartNonBlocking() error {
 	if len(listeners) == 0 {
 		return errors.Errorf("could not listen on any endpoint")
 	}
-	s.listeners = listeners
-
-	server, err := s.getGRPCServer()
-	if err != nil {
-		return err
-	}
-	s.srv = server
-
-	if s.kind == internalServer {
-		internalv1pb.RegisterServiceInvocationServer(server, s.api)
-	} else if s.kind == apiServer {
-		runtimev1pb.RegisterDaprServer(server, s.api)
-	}
 
 	for _, listener := range listeners {
-		go func(l net.Listener) {
+		// server is created in a loop because each instance
+		// has a handle on the underlying listener.
+		server, err := s.getGRPCServer()
+		if err != nil {
+			return err
+		}
+		s.servers = append(s.servers, server)
+
+		if s.kind == internalServer {
+			internalv1pb.RegisterServiceInvocationServer(server, s.api)
+		} else if s.kind == apiServer {
+			runtimev1pb.RegisterDaprServer(server, s.api)
+		}
+
+		go func(server *grpc_go.Server, l net.Listener) {
 			if err := server.Serve(l); err != nil {
 				s.logger.Fatalf("gRPC serve error: %v", err)
 			}
-		}(listener)
+		}(server, listener)
 	}
+	return nil
+}
+
+func (s *server) Close() error {
+	for _, server := range s.servers {
+		// This calls `Close()` on the underlying listener.
+		server.GracefulStop()
+	}
+
 	return nil
 }
 
@@ -199,6 +220,13 @@ func (s *server) getMiddlewareOptions() []grpc_go.ServerOption {
 		intr = append(intr, diag.DefaultGRPCMonitoring.UnaryServerInterceptor())
 	}
 
+	apiLogLevel := s.config.APILoglevel
+	if strings.EqualFold(apiLogLevel, "info") {
+		intr = append(intr, s.getGRPCAPILoggingInfo(apiLogLevel))
+	} else if strings.EqualFold(apiLogLevel, "debug") {
+		intr = append(intr, s.getGRPCAPILoggingDebug(apiLogLevel))
+	}
+
 	chain := grpc_middleware.ChainUnaryServer(
 		intr...,
 	)
@@ -244,7 +272,7 @@ func (s *server) getGRPCServer() (*grpc_go.Server, error) {
 		go s.startWorkloadCertRotation()
 	}
 
-	opts = append(opts, grpc_go.MaxRecvMsgSize(s.config.MaxRequestBodySize*1024*1024), grpc_go.MaxSendMsgSize(s.config.MaxRequestBodySize*1024*1024))
+	opts = append(opts, grpc_go.MaxRecvMsgSize(s.config.MaxRequestBodySize*1024*1024), grpc_go.MaxSendMsgSize(s.config.MaxRequestBodySize*1024*1024), grpc_go.MaxHeaderListSize(uint32(s.config.ReadBufferSize*1024)))
 
 	if s.proxy != nil {
 		opts = append(opts, grpc_go.UnknownServiceHandler(s.proxy.Handler()))
@@ -281,4 +309,18 @@ func shouldRenewCert(certExpiryDate time.Time, certDuration time.Duration) bool 
 
 	percentagePassed := 100 - ((expiresInSeconds / certDurationSeconds) * 100)
 	return percentagePassed >= renewWhenPercentagePassed
+}
+
+func (s *server) getGRPCAPILoggingInfo(apiLogLevel string) grpc_go.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc_go.UnaryServerInfo, handler grpc_go.UnaryHandler) (interface{}, error) {
+		s.logger.Info("gRPC API Called: ", *info)
+		return handler(ctx, req)
+	}
+}
+
+func (s *server) getGRPCAPILoggingDebug(apiLogLevel string) grpc_go.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc_go.UnaryServerInfo, handler grpc_go.UnaryHandler) (interface{}, error) {
+		s.logger.Debug("gRPC API Called: ", *info)
+		return handler(ctx, req)
+	}
 }

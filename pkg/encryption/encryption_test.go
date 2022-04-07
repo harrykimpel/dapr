@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package encryption
 
@@ -79,7 +87,7 @@ func TestComponentEncryptionKey(t *testing.T) {
 
 		rand.Read(bytes)
 
-		secondaryKey := hex.EncodeToString(bytes)
+		secondaryKey := hex.EncodeToString(bytes[:16]) // 128-bit key
 
 		secretStore := &mockSecretStore{}
 		secretStore.Init(secretstores.Metadata{
@@ -160,25 +168,81 @@ func TestTryGetEncryptionKeyFromMetadataItem(t *testing.T) {
 
 func TestCreateCipher(t *testing.T) {
 	t.Run("invalid key", func(t *testing.T) {
-		gcm, err := createCipher(Key{
+		cipherObj, err := createCipher(Key{
 			Key: "123",
-		}, AES256Algorithm)
+		}, AESGCMAlgorithm)
 
-		assert.Nil(t, gcm)
+		assert.Nil(t, cipherObj)
 		assert.Error(t, err)
 	})
 
-	t.Run("valid key", func(t *testing.T) {
+	t.Run("valid 256-bit key", func(t *testing.T) {
 		bytes := make([]byte, 32)
 		rand.Read(bytes)
 
 		key := hex.EncodeToString(bytes)
 
-		gcm, err := createCipher(Key{
+		cipherObj, err := createCipher(Key{
 			Key: key,
-		}, AES256Algorithm)
+		}, AESGCMAlgorithm)
 
-		assert.NotNil(t, gcm)
+		assert.NotNil(t, cipherObj)
 		assert.NoError(t, err)
+	})
+
+	t.Run("valid 192-bit key", func(t *testing.T) {
+		bytes := make([]byte, 24)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, AESGCMAlgorithm)
+
+		assert.NotNil(t, cipherObj)
+		assert.NoError(t, err)
+	})
+
+	t.Run("valid 128-bit key", func(t *testing.T) {
+		bytes := make([]byte, 16)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, AESGCMAlgorithm)
+
+		assert.NotNil(t, cipherObj)
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid key size", func(t *testing.T) {
+		bytes := make([]byte, 18)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, AESGCMAlgorithm)
+
+		assert.Nil(t, cipherObj)
+		assert.Error(t, err)
+	})
+
+	t.Run("invalid algorithm", func(t *testing.T) {
+		bytes := make([]byte, 32)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		cipherObj, err := createCipher(Key{
+			Key: key,
+		}, "3DES")
+
+		assert.Nil(t, cipherObj)
+		assert.Error(t, err)
 	})
 }

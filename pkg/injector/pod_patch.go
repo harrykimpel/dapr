@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package injector
 
@@ -60,8 +68,15 @@ const (
 	daprReadinessProbeTimeoutKey      = "dapr.io/sidecar-readiness-probe-timeout-seconds"
 	daprReadinessProbePeriodKey       = "dapr.io/sidecar-readiness-probe-period-seconds"
 	daprReadinessProbeThresholdKey    = "dapr.io/sidecar-readiness-probe-threshold"
-	daprMaxRequestBodySize            = "dapr.io/http-max-request-size"
+	daprImage                         = "dapr.io/sidecar-image"
 	daprAppSSLKey                     = "dapr.io/app-ssl"
+	daprMaxRequestBodySize            = "dapr.io/http-max-request-size"
+	daprReadBufferSize                = "dapr.io/http-read-buffer-size"
+	daprHTTPStreamRequestBody         = "dapr.io/http-stream-request-body"
+	daprGracefulShutdownSeconds       = "dapr.io/graceful-shutdown-seconds"
+	daprAPILogLevel                   = "dapr.io/api-log-level"
+	daprUnixDomainSocketPath          = "dapr.io/unix-domain-socket-path"
+	unixDomainSocketVolume            = "dapr-unix-domain-socket"
 	containersPath                    = "/spec/containers"
 	sidecarHTTPPort                   = 3500
 	sidecarAPIGRPCPort                = 50001
@@ -98,6 +113,8 @@ const (
 	apiVersionV1                      = "v1.0"
 	defaultMtlsEnabled                = true
 	trueString                        = "true"
+	defaultDaprHTTPStreamRequestBody  = false
+	defaultAPILogLevel                = ""
 )
 
 func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
@@ -145,14 +162,16 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 	trustAnchors, certChain, certKey = getTrustAnchorsAndCertChain(kubeClient, namespace)
 	identity = fmt.Sprintf("%s:%s", req.Namespace, pod.Spec.ServiceAccountName)
 
+	socketMount := appendUnixDomainSocketVolume(&pod)
 	tokenMount := getTokenVolumeMount(pod)
-	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSvcAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
+	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSvcAddress, placementAddress, socketMount, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
 	if err != nil {
 		return nil, err
 	}
 
 	patchOps := []PatchOperation{}
 	envPatchOps := []PatchOperation{}
+	socketVolumentPatchOps := []PatchOperation{}
 	var path string
 	var value interface{}
 	if len(pod.Spec.Containers) == 0 {
@@ -160,6 +179,7 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 		value = []corev1.Container{*sidecarContainer}
 	} else {
 		envPatchOps = addDaprEnvVarsToContainers(pod.Spec.Containers)
+		socketVolumentPatchOps = addSocketVolumeToContainers(pod.Spec.Containers, socketMount)
 		path = "/spec/containers/-"
 		value = sidecarContainer
 	}
@@ -173,6 +193,7 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 		},
 	)
 	patchOps = append(patchOps, envPatchOps...)
+	patchOps = append(patchOps, socketVolumentPatchOps...)
 
 	return patchOps, nil
 }
@@ -230,6 +251,65 @@ LoopEnv:
 			Value: env,
 		})
 	}
+	return patchOps
+}
+
+// This function add Dapr unix domain socket volume to all the containers in any Dapr enabled pod.
+func addSocketVolumeToContainers(containers []corev1.Container, socketVolumeMount *corev1.VolumeMount) []PatchOperation {
+	if socketVolumeMount == nil {
+		return []PatchOperation{}
+	}
+
+	return addVolumeToContainers(containers, *socketVolumeMount)
+}
+
+func addVolumeToContainers(containers []corev1.Container, addMounts corev1.VolumeMount) []PatchOperation {
+	volumeMount := []corev1.VolumeMount{addMounts}
+	volumeMountPatchOps := make([]PatchOperation, 0, len(containers))
+	for i, container := range containers {
+		path := fmt.Sprintf("%s/%d/volumeMounts", containersPath, i)
+		patchOps := getVolumeMountPatchOperations(container.VolumeMounts, volumeMount, path)
+		volumeMountPatchOps = append(volumeMountPatchOps, patchOps...)
+	}
+	return volumeMountPatchOps
+}
+
+// It does not override existing values for those variables if they have been defined already.
+func getVolumeMountPatchOperations(volumentMounts []corev1.VolumeMount, addMounts []corev1.VolumeMount, path string) []PatchOperation {
+	if len(volumentMounts) == 0 {
+		// If there are no volume mount variables defined in the container, we initialize a slice of environment vars.
+		return []PatchOperation{
+			{
+				Op:    "add",
+				Path:  path,
+				Value: addMounts,
+			},
+		}
+	}
+	// If there are existing volume mounts, then we are adding to an existing slice of volume mounts.
+	path += "/-"
+
+	var patchOps []PatchOperation
+
+	for _, addMount := range addMounts {
+		isConflict := false
+		for _, mount := range volumentMounts {
+			// conflict cases
+			if addMount.Name == mount.Name || addMount.MountPath == mount.MountPath {
+				isConflict = true
+				break
+			}
+		}
+
+		if !isConflict {
+			patchOps = append(patchOps, PatchOperation{
+				Op:    "add",
+				Path:  path,
+				Value: addMount,
+			})
+		}
+	}
+
 	return patchOps
 }
 
@@ -348,6 +428,22 @@ func getListenAddresses(annotations map[string]string) string {
 	return getStringAnnotationOrDefault(annotations, daprListenAddresses, defaultSidecarListenAddresses)
 }
 
+func getReadBufferSize(annotations map[string]string) (int32, error) {
+	return getInt32Annotation(annotations, daprReadBufferSize)
+}
+
+func getGracefulShutdownSeconds(annotations map[string]string) (int32, error) {
+	return getInt32Annotation(annotations, daprGracefulShutdownSeconds)
+}
+
+func getUnixDomainSocketPath(annotations map[string]string) string {
+	return getStringAnnotationOrDefault(annotations, daprUnixDomainSocketPath, "")
+}
+
+func HTTPStreamRequestBodyEnabled(annotations map[string]string) bool {
+	return getBoolAnnotationOrDefault(annotations, daprHTTPStreamRequestBody, defaultDaprHTTPStreamRequestBody)
+}
+
 func getBoolAnnotationOrDefault(annotations map[string]string, key string, defaultValue bool) bool {
 	enabled, ok := annotations[key]
 	if !ok {
@@ -393,8 +489,8 @@ func getInt32Annotation(annotations map[string]string, key string) (int32, error
 	return int32(value), nil
 }
 
-func getProbeHTTPHandler(port int32, pathElements ...string) corev1.Handler {
-	return corev1.Handler{
+func getProbeHTTPHandler(port int32, pathElements ...string) corev1.ProbeHandler {
+	return corev1.ProbeHandler{
 		HTTPGet: &corev1.HTTPGetAction{
 			Path: formatProbePath(pathElements...),
 			Port: intstr.IntOrString{IntVal: port},
@@ -467,6 +563,10 @@ func isResourceDaprEnabled(annotations map[string]string) bool {
 	return getBoolAnnotationOrDefault(annotations, daprEnabledKey, false)
 }
 
+func getAPILogLevel(annotations map[string]string) string {
+	return getStringAnnotationOrDefault(annotations, daprAPILogLevel, defaultAPILogLevel)
+}
+
 func getServiceAddress(name, namespace, clusterDomain string, port int) string {
 	return fmt.Sprintf("%s.%s.svc.%s:%d", name, namespace, clusterDomain, port)
 }
@@ -484,7 +584,7 @@ func getPullPolicy(pullPolicy string) corev1.PullPolicy {
 	}
 }
 
-func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, imagePullPolicy, namespace, controlPlaneAddress, placementServiceAddress string, tokenVolumeMount *corev1.VolumeMount, trustAnchors, certChain, certKey, sentryAddress string, mtlsEnabled bool, identity string) (*corev1.Container, error) {
+func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, imagePullPolicy, namespace, controlPlaneAddress, placementServiceAddress string, socketVolumeMount, tokenVolumeMount *corev1.VolumeMount, trustAnchors, certChain, certKey, sentryAddress string, mtlsEnabled bool, identity string) (*corev1.Container, error) {
 	appPort, err := getAppPort(annotations)
 	if err != nil {
 		return nil, err
@@ -514,6 +614,18 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 	if err != nil {
 		log.Warn(err)
 	}
+
+	readBufferSize, err := getReadBufferSize(annotations)
+	if err != nil {
+		log.Warn(err)
+	}
+
+	gracefulShutdownSeconds, err := getGracefulShutdownSeconds(annotations)
+	if err != nil {
+		log.Warn(err)
+	}
+
+	HTTPStreamRequestBodyEnabled := HTTPStreamRequestBodyEnabled(annotations)
 
 	ports := []corev1.ContainerPort{
 		{
@@ -555,6 +667,9 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		fmt.Sprintf("--enable-metrics=%t", metricsEnabled),
 		"--metrics-port", fmt.Sprintf("%v", metricsPort),
 		"--dapr-http-max-request-size", fmt.Sprintf("%v", requestBodySize),
+		"--dapr-http-read-buffer-size", fmt.Sprintf("%v", readBufferSize),
+		"--dapr-graceful-shutdown-seconds", fmt.Sprintf("%v", gracefulShutdownSeconds),
+		"--api-log-level", getAPILogLevel(annotations),
 	}
 
 	debugEnabled := getEnableDebug(annotations)
@@ -579,6 +694,10 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		}, args...)
 	}
 
+	if image := getStringAnnotation(annotations, daprImage); image != "" {
+		daprSidecarImage = image
+	}
+
 	c := &corev1.Container{
 		Name:            sidecarContainerName,
 		Image:           daprSidecarImage,
@@ -593,17 +712,25 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 				Name:  "NAMESPACE",
 				Value: namespace,
 			},
+			{
+				Name: "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "metadata.name",
+					},
+				},
+			},
 		},
 		Args: args,
 		ReadinessProbe: &corev1.Probe{
-			Handler:             httpHandler,
+			ProbeHandler:        httpHandler,
 			InitialDelaySeconds: getInt32AnnotationOrDefault(annotations, daprReadinessProbeDelayKey, defaultHealthzProbeDelaySeconds),
 			TimeoutSeconds:      getInt32AnnotationOrDefault(annotations, daprReadinessProbeTimeoutKey, defaultHealthzProbeTimeoutSeconds),
 			PeriodSeconds:       getInt32AnnotationOrDefault(annotations, daprReadinessProbePeriodKey, defaultHealthzProbePeriodSeconds),
 			FailureThreshold:    getInt32AnnotationOrDefault(annotations, daprReadinessProbeThresholdKey, defaultHealthzProbeThreshold),
 		},
 		LivenessProbe: &corev1.Probe{
-			Handler:             httpHandler,
+			ProbeHandler:        httpHandler,
 			InitialDelaySeconds: getInt32AnnotationOrDefault(annotations, daprLivenessProbeDelayKey, defaultHealthzProbeDelaySeconds),
 			TimeoutSeconds:      getInt32AnnotationOrDefault(annotations, daprLivenessProbeTimeoutKey, defaultHealthzProbeTimeoutSeconds),
 			PeriodSeconds:       getInt32AnnotationOrDefault(annotations, daprLivenessProbePeriodKey, defaultHealthzProbePeriodSeconds),
@@ -613,10 +740,12 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 
 	c.Env = append(c.Env, utils.ParseEnvString(annotations[daprEnvKey])...)
 
+	if socketVolumeMount != nil {
+		c.VolumeMounts = []corev1.VolumeMount{*socketVolumeMount}
+	}
+
 	if tokenVolumeMount != nil {
-		c.VolumeMounts = []corev1.VolumeMount{
-			*tokenVolumeMount,
-		}
+		c.VolumeMounts = append(c.VolumeMounts, *tokenVolumeMount)
 	}
 
 	if logAsJSONEnabled(annotations) {
@@ -650,6 +779,10 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 
 	if sslEnabled {
 		c.Args = append(c.Args, "--app-ssl")
+	}
+
+	if HTTPStreamRequestBodyEnabled {
+		c.Args = append(c.Args, "--http-stream-request-body")
 	}
 
 	secret := getAPITokenSecret(annotations)
@@ -690,4 +823,21 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		c.Resources = *resources
 	}
 	return c, nil
+}
+
+func appendUnixDomainSocketVolume(pod *corev1.Pod) *corev1.VolumeMount {
+	unixDomainSocket := getUnixDomainSocketPath(pod.Annotations)
+
+	if unixDomainSocket == "" {
+		return nil
+	}
+
+	// socketVolume is an EmptyDir
+	socketVolume := &corev1.Volume{
+		Name: unixDomainSocketVolume,
+	}
+
+	pod.Spec.Volumes = append(pod.Spec.Volumes, *socketVolume)
+
+	return &corev1.VolumeMount{Name: unixDomainSocketVolume, MountPath: unixDomainSocket}
 }

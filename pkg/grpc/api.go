@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package grpc
 
@@ -9,8 +17,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
+	"time"
+
+	"github.com/dapr/components-contrib/configuration"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	jsoniter "github.com/json-iterator/go"
@@ -21,6 +33,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/contenttype"
 	contrib_metadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/components-contrib/secretstores"
@@ -41,6 +54,7 @@ import (
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+	"github.com/dapr/dapr/pkg/resiliency"
 	runtime_pubsub "github.com/dapr/dapr/pkg/runtime/pubsub"
 )
 
@@ -62,7 +76,11 @@ type API interface {
 	GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequest) (*runtimev1pb.GetBulkStateResponse, error)
 	GetSecret(ctx context.Context, in *runtimev1pb.GetSecretRequest) (*runtimev1pb.GetSecretResponse, error)
 	GetBulkSecret(ctx context.Context, in *runtimev1pb.GetBulkSecretRequest) (*runtimev1pb.GetBulkSecretResponse, error)
+	GetConfigurationAlpha1(ctx context.Context, in *runtimev1pb.GetConfigurationRequest) (*runtimev1pb.GetConfigurationResponse, error)
+	SubscribeConfigurationAlpha1(request *runtimev1pb.SubscribeConfigurationRequest, configurationServer runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server) error
+	UnsubscribeConfigurationAlpha1(ctx context.Context, request *runtimev1pb.UnsubscribeConfigurationRequest) (*runtimev1pb.UnsubscribeConfigurationResponse, error)
 	SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (*emptypb.Empty, error)
+	QueryStateAlpha1(ctx context.Context, in *runtimev1pb.QueryStateRequest) (*runtimev1pb.QueryStateResponse, error)
 	DeleteState(ctx context.Context, in *runtimev1pb.DeleteStateRequest) (*emptypb.Empty, error)
 	DeleteBulkState(ctx context.Context, in *runtimev1pb.DeleteBulkStateRequest) (*emptypb.Empty, error)
 	ExecuteStateTransaction(ctx context.Context, in *runtimev1pb.ExecuteStateTransactionRequest) (*emptypb.Empty, error)
@@ -73,6 +91,7 @@ type API interface {
 	UnregisterActorTimer(ctx context.Context, in *runtimev1pb.UnregisterActorTimerRequest) (*emptypb.Empty, error)
 	RegisterActorReminder(ctx context.Context, in *runtimev1pb.RegisterActorReminderRequest) (*emptypb.Empty, error)
 	UnregisterActorReminder(ctx context.Context, in *runtimev1pb.UnregisterActorReminderRequest) (*emptypb.Empty, error)
+	RenameActorReminder(ctx context.Context, in *runtimev1pb.RenameActorReminderRequest) (*emptypb.Empty, error)
 	GetActorState(ctx context.Context, in *runtimev1pb.GetActorStateRequest) (*runtimev1pb.GetActorStateResponse, error)
 	ExecuteActorStateTransaction(ctx context.Context, in *runtimev1pb.ExecuteActorStateTransactionRequest) (*emptypb.Empty, error)
 	InvokeActor(ctx context.Context, in *runtimev1pb.InvokeActorRequest) (*runtimev1pb.InvokeActorResponse, error)
@@ -85,30 +104,36 @@ type API interface {
 }
 
 type api struct {
-	actor                    actors.Actors
-	directMessaging          messaging.DirectMessaging
-	appChannel               channel.AppChannel
-	stateStores              map[string]state.Store
-	transactionalStateStores map[string]state.TransactionalStore
-	secretStores             map[string]secretstores.SecretStore
-	secretsConfiguration     map[string]config.SecretsScope
-	pubsubAdapter            runtime_pubsub.Adapter
-	id                       string
-	sendToOutputBindingFn    func(name string, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error)
-	tracingSpec              config.TracingSpec
-	accessControlList        *config.AccessControlList
-	appProtocol              string
-	extendedMetadata         sync.Map
-	components               []components_v1alpha.Component
-	shutdown                 func()
+	actor                      actors.Actors
+	directMessaging            messaging.DirectMessaging
+	appChannel                 channel.AppChannel
+	resiliency                 resiliency.Provider
+	stateStores                map[string]state.Store
+	transactionalStateStores   map[string]state.TransactionalStore
+	secretStores               map[string]secretstores.SecretStore
+	secretsConfiguration       map[string]config.SecretsScope
+	configurationStores        map[string]configuration.Store
+	configurationSubscribe     map[string]chan struct{} // store map[storeName||key1,key2] -> stopChan
+	configurationSubscribeLock sync.Mutex
+	pubsubAdapter              runtime_pubsub.Adapter
+	id                         string
+	sendToOutputBindingFn      func(name string, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error)
+	tracingSpec                config.TracingSpec
+	accessControlList          *config.AccessControlList
+	appProtocol                string
+	extendedMetadata           sync.Map
+	components                 []components_v1alpha.Component
+	shutdown                   func()
 }
 
 // NewAPI returns a new gRPC API.
 func NewAPI(
 	appID string, appChannel channel.AppChannel,
+	resiliency resiliency.Provider,
 	stateStores map[string]state.Store,
 	secretStores map[string]secretstores.SecretStore,
 	secretsConfiguration map[string]config.SecretsScope,
+	configurationStores map[string]configuration.Store,
 	pubsubAdapter runtime_pubsub.Adapter,
 	directMessaging messaging.DirectMessaging,
 	actor actors.Actors,
@@ -129,11 +154,14 @@ func NewAPI(
 		directMessaging:          directMessaging,
 		actor:                    actor,
 		id:                       appID,
+		resiliency:               resiliency,
 		appChannel:               appChannel,
 		pubsubAdapter:            pubsubAdapter,
 		stateStores:              stateStores,
 		transactionalStateStores: transactionalStateStores,
 		secretStores:             secretStores,
+		configurationStores:      configurationStores,
+		configurationSubscribe:   make(map[string]chan struct{}),
 		secretsConfiguration:     secretsConfiguration,
 		sendToOutputBindingFn:    sendToOutputBindingFn,
 		tracingSpec:              tracingSpec,
@@ -187,6 +215,7 @@ func (a *api) CallActor(ctx context.Context, in *internalv1pb.InternalInvokeRequ
 		return nil, status.Errorf(codes.InvalidArgument, messages.ErrInternalInvokeRequest, err.Error())
 	}
 
+	// We don't do resiliency here as it is handled in the API layer. See InvokeActor().
 	resp, err := a.actor.Call(ctx, req)
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrActorInvoke, err)
@@ -231,7 +260,10 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 	}
 
 	span := diag_utils.SpanFromContext(ctx)
+	// Populate W3C traceparent to cloudevent envelope
 	corID := diag.SpanContextToW3CString(span.SpanContext())
+	// Populate W3C tracestate to cloudevent envelope
+	traceState := diag.TraceStateToW3CString(span.SpanContext())
 
 	body := []byte{}
 	if in.Data != nil {
@@ -247,6 +279,7 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 			DataContentType: in.DataContentType,
 			Data:            body,
 			TraceID:         corID,
+			TraceState:      traceState,
 			Pubsub:          in.PubsubName,
 		})
 		if err != nil {
@@ -273,7 +306,12 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 		Metadata:   in.Metadata,
 	}
 
+	start := time.Now()
 	err := a.pubsubAdapter.Publish(&req)
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.PubsubEgressEvent(context.Background(), pubsubName, topic, err == nil, elapsed)
+
 	if err != nil {
 		nerr := status.Errorf(codes.Internal, messages.ErrPubsubPublishMessage, topic, pubsubName, err.Error())
 		if errors.As(err, &runtime_pubsub.NotAllowedError{}) {
@@ -286,6 +324,7 @@ func (a *api) PublishEvent(ctx context.Context, in *runtimev1pb.PublishEventRequ
 		apiServerLogger.Debug(nerr)
 		return &emptypb.Empty{}, nerr
 	}
+
 	return &emptypb.Empty{}, nil
 }
 
@@ -300,31 +339,46 @@ func (a *api) InvokeService(ctx context.Context, in *runtimev1pb.InvokeServiceRe
 		return nil, status.Errorf(codes.Internal, messages.ErrDirectInvokeNotReady)
 	}
 
-	resp, err := a.directMessaging.Invoke(ctx, in.Id, req)
-	if err != nil {
-		err = status.Errorf(codes.Internal, messages.ErrDirectInvoke, in.Id, err)
-		return nil, err
-	}
+	policy := a.resiliency.EndpointPolicy(ctx, in.Id, fmt.Sprintf("%s:%s", in.Id, req.Message().Method))
+	var resp *invokev1.InvokeMethodResponse
+	var requestErr bool
+	respError := policy(func(ctx context.Context) (rErr error) {
+		requestErr = false
+		resp, rErr = a.directMessaging.Invoke(ctx, in.Id, req)
 
-	headerMD := invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Headers(), true)
-
-	var respError error
-	if resp.IsHTTPResponse() {
-		errorMessage := []byte("")
-		if resp != nil {
-			_, errorMessage = resp.RawData()
+		if rErr != nil {
+			requestErr = true
+			rErr = status.Errorf(codes.Internal, messages.ErrDirectInvoke, in.Id, rErr)
+			return rErr
 		}
-		respError = invokev1.ErrorFromHTTPResponseCode(int(resp.Status().Code), string(errorMessage))
-		// Populate http status code to header
-		headerMD.Set(daprHTTPStatusHeader, strconv.Itoa(int(resp.Status().Code)))
-	} else {
-		respError = invokev1.ErrorFromInternalStatus(resp.Status())
-		// ignore trailer if appchannel uses HTTP
-		grpc.SetTrailer(ctx, invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Trailers(), false))
+
+		headerMD := invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Headers(), true)
+
+		// If the status is OK, respError will be nil.
+		var respError error
+		if resp.IsHTTPResponse() {
+			errorMessage := []byte("")
+			if resp != nil {
+				_, errorMessage = resp.RawData()
+			}
+			respError = invokev1.ErrorFromHTTPResponseCode(int(resp.Status().Code), string(errorMessage))
+			// Populate http status code to header
+			headerMD.Set(daprHTTPStatusHeader, strconv.Itoa(int(resp.Status().Code)))
+		} else {
+			respError = invokev1.ErrorFromInternalStatus(resp.Status())
+			// ignore trailer if appchannel uses HTTP
+			grpc.SetTrailer(ctx, invokev1.InternalMetadataToGrpcMetadata(ctx, resp.Trailers(), false))
+		}
+
+		grpc.SetHeader(ctx, headerMD)
+
+		return respError
+	})
+
+	// In this case, there was an error with the actual request.
+	if requestErr || errors.Is(respError, context.DeadlineExceeded) {
+		return nil, respError
 	}
-
-	grpc.SetHeader(ctx, headerMD)
-
 	return resp.Message(), respError
 }
 
@@ -338,7 +392,12 @@ func (a *api) InvokeBinding(ctx context.Context, in *runtimev1pb.InvokeBindingRe
 	}
 
 	r := &runtimev1pb.InvokeBindingResponse{}
+	start := time.Now()
 	resp, err := a.sendToOutputBindingFn(in.Name, req)
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.OutputBindingEvent(context.Background(), in.Name, in.Operation, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrInvokeOutputBinding, in.Name, err.Error())
 		apiServerLogger.Debug(err)
@@ -377,7 +436,18 @@ func (a *api) GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequ
 		}
 		reqs[i] = r
 	}
-	bulkGet, responses, err := store.BulkGet(reqs)
+
+	start := time.Now()
+	var bulkGet bool
+	var responses []state.BulkGetResponse
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	err = policy(func(ctx context.Context) (rErr error) {
+		bulkGet, responses, rErr = store.BulkGet(reqs)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.BulkGet, err == nil, elapsed)
 
 	// if store supports bulk get
 	if bulkGet {
@@ -404,7 +474,12 @@ func (a *api) GetBulkState(ctx context.Context, in *runtimev1pb.GetBulkStateRequ
 	for i := 0; i < n; i++ {
 		fn := func(param interface{}) {
 			req := param.(*state.GetRequest)
-			r, err := store.Get(req)
+			var r *state.GetResponse
+			err = policy(func(ctx context.Context) (rErr error) {
+				r, rErr = store.Get(req)
+				return rErr
+			})
+
 			item := &runtimev1pb.BulkStateItem{
 				Key: state_loader.GetOriginalStateKey(req.Key),
 			}
@@ -471,7 +546,17 @@ func (a *api) GetState(ctx context.Context, in *runtimev1pb.GetStateRequest) (*r
 		},
 	}
 
-	getResponse, err := store.Get(&req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	var getResponse *state.GetResponse
+	err = policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = store.Get(&req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.Get, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrStateGet, in.Key, in.StoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -514,8 +599,16 @@ func (a *api) SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (
 		req := state.SetRequest{
 			Key:      key,
 			Metadata: s.Metadata,
-			Value:    s.Value,
 		}
+
+		if contentType, ok := req.Metadata[contrib_metadata.ContentType]; ok && contentType == contenttype.JSONContentType {
+			if err1 = jsoniter.Unmarshal(s.Value, &req.Value); err1 != nil {
+				return &emptypb.Empty{}, err1
+			}
+		} else {
+			req.Value = s.Value
+		}
+
 		if s.Etag != nil {
 			req.ETag = &s.Etag.Value
 		}
@@ -538,13 +631,85 @@ func (a *api) SaveState(ctx context.Context, in *runtimev1pb.SaveStateRequest) (
 		reqs = append(reqs, req)
 	}
 
-	err = store.BulkSet(reqs)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	err = policy(func(ctx context.Context) error {
+		return store.BulkSet(reqs)
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.Set, err == nil, elapsed)
+
 	if err != nil {
 		err = a.stateErrorResponse(err, messages.ErrStateSave, in.StoreName, err.Error())
 		apiServerLogger.Debug(err)
 		return &emptypb.Empty{}, err
 	}
 	return &emptypb.Empty{}, nil
+}
+
+func (a *api) QueryStateAlpha1(ctx context.Context, in *runtimev1pb.QueryStateRequest) (*runtimev1pb.QueryStateResponse, error) {
+	ret := &runtimev1pb.QueryStateResponse{}
+
+	store, err := a.getStateStore(in.StoreName)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return ret, err
+	}
+
+	querier, ok := store.(state.Querier)
+	if !ok {
+		err = status.Errorf(codes.Unimplemented, messages.ErrNotFound, "Query")
+		apiServerLogger.Debug(err)
+		return ret, err
+	}
+
+	if encryption.EncryptedStateStore(in.StoreName) {
+		err = status.Errorf(codes.Aborted, messages.ErrStateQuery, in.GetStoreName(), "cannot query encrypted store")
+		apiServerLogger.Debug(err)
+		return ret, err
+	}
+
+	var req state.QueryRequest
+	if err = jsoniter.Unmarshal([]byte(in.GetQuery()), &req.Query); err != nil {
+		err = status.Errorf(codes.InvalidArgument, messages.ErrMalformedRequest, err.Error())
+		apiServerLogger.Debug(err)
+		return ret, err
+	}
+	req.Metadata = in.GetMetadata()
+
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	var resp *state.QueryResponse
+	err = policy(func(ctx context.Context) (rErr error) {
+		resp, rErr = querier.Query(&req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.StateQuery, err == nil, elapsed)
+
+	if err != nil {
+		err = status.Errorf(codes.Internal, messages.ErrStateQuery, in.GetStoreName(), err.Error())
+		apiServerLogger.Debug(err)
+		return ret, err
+	}
+	if resp == nil || len(resp.Results) == 0 {
+		return ret, nil
+	}
+
+	ret.Results = make([]*runtimev1pb.QueryStateItem, len(resp.Results))
+	ret.Token = resp.Token
+	ret.Metadata = resp.Metadata
+
+	for i := range resp.Results {
+		ret.Results[i] = &runtimev1pb.QueryStateItem{
+			Key:  state_loader.GetOriginalStateKey(resp.Results[i].Key),
+			Data: resp.Results[i].Data,
+		}
+	}
+
+	return ret, nil
 }
 
 // stateErrorResponse takes a state store error, format and args and returns a status code encoded gRPC error.
@@ -588,7 +753,15 @@ func (a *api) DeleteState(ctx context.Context, in *runtimev1pb.DeleteStateReques
 		}
 	}
 
-	err = store.Delete(&req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	err = policy(func(ctx context.Context) error {
+		return store.Delete(&req)
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.Delete, err == nil, elapsed)
+
 	if err != nil {
 		err = a.stateErrorResponse(err, messages.ErrStateDelete, in.Key, err.Error())
 		apiServerLogger.Debug(err)
@@ -625,7 +798,16 @@ func (a *api) DeleteBulkState(ctx context.Context, in *runtimev1pb.DeleteBulkSta
 		}
 		reqs = append(reqs, req)
 	}
-	err = store.BulkDelete(reqs)
+
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	err = policy(func(ctx context.Context) error {
+		return store.BulkDelete(reqs)
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.BulkDelete, err == nil, elapsed)
+
 	if err != nil {
 		apiServerLogger.Debug(err)
 		return &emptypb.Empty{}, err
@@ -659,7 +841,17 @@ func (a *api) GetSecret(ctx context.Context, in *runtimev1pb.GetSecretRequest) (
 		Metadata: in.Metadata,
 	}
 
-	getResponse, err := a.secretStores[secretStoreName].GetSecret(req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, secretStoreName)
+	var getResponse secretstores.GetSecretResponse
+	err := policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = a.secretStores[secretStoreName].GetSecret(req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.SecretInvoked(ctx, in.StoreName, diag.Get, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrSecretGet, req.Name, secretStoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -692,7 +884,17 @@ func (a *api) GetBulkSecret(ctx context.Context, in *runtimev1pb.GetBulkSecretRe
 		Metadata: in.Metadata,
 	}
 
-	getResponse, err := a.secretStores[secretStoreName].BulkGetSecret(req)
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, secretStoreName)
+	var getResponse secretstores.BulkGetSecretResponse
+	err := policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = a.secretStores[secretStoreName].BulkGetSecret(req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.SecretInvoked(ctx, in.StoreName, diag.BulkGet, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrBulkSecretGet, secretStoreName, err.Error())
 		apiServerLogger.Debug(err)
@@ -831,10 +1033,18 @@ func (a *api) ExecuteStateTransaction(ctx context.Context, in *runtimev1pb.Execu
 		}
 	}
 
-	err := transactionalStore.Multi(&state.TransactionalStateRequest{
-		Operations: operations,
-		Metadata:   in.Metadata,
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	err := policy(func(ctx context.Context) error {
+		return transactionalStore.Multi(&state.TransactionalStateRequest{
+			Operations: operations,
+			Metadata:   in.Metadata,
+		})
 	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.StateInvoked(ctx, in.StoreName, diag.StateTransaction, err == nil, elapsed)
+
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrStateTransaction, err.Error())
 		apiServerLogger.Debug(err)
@@ -921,6 +1131,24 @@ func (a *api) UnregisterActorReminder(ctx context.Context, in *runtimev1pb.Unreg
 	}
 
 	err := a.actor.DeleteReminder(ctx, req)
+	return &emptypb.Empty{}, err
+}
+
+func (a *api) RenameActorReminder(ctx context.Context, in *runtimev1pb.RenameActorReminderRequest) (*emptypb.Empty, error) {
+	if a.actor == nil {
+		err := status.Errorf(codes.Internal, messages.ErrActorRuntimeNotFound)
+		apiServerLogger.Debug(err)
+		return &emptypb.Empty{}, err
+	}
+
+	req := &actors.RenameReminderRequest{
+		OldName:   in.OldName,
+		ActorID:   in.ActorId,
+		ActorType: in.ActorType,
+		NewName:   in.NewName,
+	}
+
+	err := a.actor.RenameReminder(ctx, req)
 	return &emptypb.Empty{}, err
 }
 
@@ -1047,7 +1275,19 @@ func (a *api) InvokeActor(ctx context.Context, in *runtimev1pb.InvokeActorReques
 	req.WithActor(in.ActorType, in.ActorId)
 	req.WithRawData(in.Data, "")
 
-	resp, err := a.actor.Call(context.TODO(), req)
+	// Unlike other actor calls, resiliency is handled here for invocation.
+	// This is due to actor invocation involving a lookup for the host.
+	// Having the retry here allows us to capture that and be resilient to host failure.
+	// Additionally, we don't perform timeouts at this level. This is because an actor
+	// should technically wait forever on the locking mechanism. If we timeout while
+	// waiting for the lock, we can also create a queue of calls that will try and continue
+	// after the timeout.
+	resp := invokev1.NewInvokeMethodResponse(500, "Blank request", nil)
+	policy := a.resiliency.ActorPreLockPolicy(ctx, in.ActorType, in.ActorId)
+	err := policy(func(ctx context.Context) (rErr error) {
+		resp, rErr = a.actor.Call(ctx, req)
+		return rErr
+	})
 	if err != nil {
 		err = status.Errorf(codes.Internal, messages.ErrActorInvoke, err)
 		apiServerLogger.Debug(err)
@@ -1064,7 +1304,7 @@ func (a *api) isSecretAllowed(storeName, key string) bool {
 	if config, ok := a.secretsConfiguration[storeName]; ok {
 		return config.IsSecretAllowed(key)
 	}
-	// By default if a configuration is not defined for a secret store, return true.
+	// By default, if a configuration is not defined for a secret store, return true.
 	return true
 }
 
@@ -1105,7 +1345,7 @@ func (a *api) GetMetadata(ctx context.Context, in *emptypb.Empty) (*runtimev1pb.
 	return response, nil
 }
 
-// Sets value in extended metadata of the sidecar.
+// SetMetadata Sets value in extended metadata of the sidecar.
 func (a *api) SetMetadata(ctx context.Context, in *runtimev1pb.SetMetadataRequest) (*emptypb.Empty, error) {
 	a.extendedMetadata.Store(in.Key, in.Value)
 	return &emptypb.Empty{}, nil
@@ -1126,4 +1366,214 @@ func stringValueOrEmpty(value *string) string {
 	}
 
 	return *value
+}
+
+func (a *api) getConfigurationStore(name string) (configuration.Store, error) {
+	if a.configurationStores == nil || len(a.configurationStores) == 0 {
+		return nil, status.Error(codes.FailedPrecondition, messages.ErrConfigurationStoresNotConfigured)
+	}
+
+	if a.configurationStores[name] == nil {
+		return nil, status.Errorf(codes.InvalidArgument, messages.ErrConfigurationStoreNotFound, name)
+	}
+	return a.configurationStores[name], nil
+}
+
+func (a *api) GetConfigurationAlpha1(ctx context.Context, in *runtimev1pb.GetConfigurationRequest) (*runtimev1pb.GetConfigurationResponse, error) {
+	store, err := a.getConfigurationStore(in.StoreName)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.GetConfigurationResponse{}, err
+	}
+
+	req := configuration.GetRequest{
+		Keys:     in.Keys,
+		Metadata: in.Metadata,
+	}
+
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, in.StoreName)
+	var getResponse *configuration.GetResponse
+	err = policy(func(ctx context.Context) (rErr error) {
+		getResponse, rErr = store.Get(ctx, &req)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.ConfigurationInvoked(ctx, in.StoreName, diag.Get, err == nil, elapsed)
+
+	if err != nil {
+		err = status.Errorf(codes.Internal, messages.ErrConfigurationGet, req.Keys, in.StoreName, err.Error())
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.GetConfigurationResponse{}, err
+	}
+
+	cachedItems := make([]*commonv1pb.ConfigurationItem, 0)
+	for _, v := range getResponse.Items {
+		cachedItems = append(cachedItems, &commonv1pb.ConfigurationItem{
+			Key:      v.Key,
+			Metadata: v.Metadata,
+			Value:    v.Value,
+			Version:  v.Version,
+		})
+	}
+
+	response := &runtimev1pb.GetConfigurationResponse{
+		Items: cachedItems,
+	}
+
+	return response, nil
+}
+
+type configurationEventHandler struct {
+	api          *api
+	storeName    string
+	serverStream runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server
+}
+
+func (h *configurationEventHandler) updateEventHandler(ctx context.Context, e *configuration.UpdateEvent) error {
+	items := make([]*commonv1pb.ConfigurationItem, 0)
+	for _, v := range e.Items {
+		items = append(items, &commonv1pb.ConfigurationItem{
+			Key:      v.Key,
+			Value:    v.Value,
+			Version:  v.Version,
+			Metadata: v.Metadata,
+		})
+	}
+
+	if err := h.serverStream.Send(&runtimev1pb.SubscribeConfigurationResponse{
+		Items: items,
+		Id:    e.ID,
+	}); err != nil {
+		apiServerLogger.Debug(err)
+	}
+	return nil
+}
+
+func (a *api) SubscribeConfigurationAlpha1(request *runtimev1pb.SubscribeConfigurationRequest, configurationServer runtimev1pb.Dapr_SubscribeConfigurationAlpha1Server) error {
+	store, err := a.getConfigurationStore(request.StoreName)
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return err
+	}
+	sort.Slice(request.Keys, func(i, j int) bool {
+		return request.Keys[i] < request.Keys[j]
+	})
+
+	subscribeKeys := make([]string, 0)
+
+	// TODO(@halspang) provide a switch to use just resiliency or this.
+	newCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// empty list means subscribing to all configuration keys
+	if len(request.Keys) == 0 {
+		getConfigurationReq := &runtimev1pb.GetConfigurationRequest{
+			StoreName: request.StoreName,
+			Keys:      []string{},
+			Metadata:  request.GetMetadata(),
+		}
+		resp, err2 := a.GetConfigurationAlpha1(newCtx, getConfigurationReq)
+		if err2 != nil {
+			err2 = status.Errorf(codes.Internal, fmt.Sprintf(messages.ErrConfigurationGet, request.Keys, request.StoreName, err2))
+			apiServerLogger.Debug(err2)
+			return err2
+		}
+
+		items := resp.GetItems()
+		for _, item := range items {
+			if _, ok := a.configurationSubscribe[fmt.Sprintf("%s||%s", request.StoreName, item.Key)]; !ok {
+				subscribeKeys = append(subscribeKeys, item.Key)
+			}
+		}
+	} else {
+		for _, k := range request.Keys {
+			if _, ok := a.configurationSubscribe[fmt.Sprintf("%s||%s", request.StoreName, k)]; !ok {
+				subscribeKeys = append(subscribeKeys, k)
+			}
+		}
+	}
+
+	req := &configuration.SubscribeRequest{
+		Keys:     subscribeKeys,
+		Metadata: request.GetMetadata(),
+	}
+
+	handler := &configurationEventHandler{
+		api:          a,
+		storeName:    request.StoreName,
+		serverStream: configurationServer,
+	}
+
+	// TODO(@laurence) deal with failed subscription and retires
+	start := time.Now()
+	policy := a.resiliency.ComponentOutboundPolicy(newCtx, request.StoreName)
+	var id string
+	err = policy(func(ctx context.Context) (rErr error) {
+		id, rErr = store.Subscribe(ctx, req, handler.updateEventHandler)
+		return rErr
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.ConfigurationInvoked(context.Background(), request.StoreName, diag.ConfigurationSubscribe, err == nil, elapsed)
+
+	if err != nil {
+		err = status.Errorf(codes.InvalidArgument, messages.ErrConfigurationSubscribe, req.Keys, request.StoreName, err.Error())
+		apiServerLogger.Debug(err)
+		return err
+	}
+	stop := make(chan struct{})
+	a.configurationSubscribeLock.Lock()
+	a.configurationSubscribe[id] = stop
+	a.configurationSubscribeLock.Unlock()
+	<-stop
+	return nil
+}
+
+func (a *api) UnsubscribeConfigurationAlpha1(ctx context.Context, request *runtimev1pb.UnsubscribeConfigurationRequest) (*runtimev1pb.UnsubscribeConfigurationResponse, error) {
+	store, err := a.getConfigurationStore(request.GetStoreName())
+	if err != nil {
+		apiServerLogger.Debug(err)
+		return &runtimev1pb.UnsubscribeConfigurationResponse{
+			Ok:      false,
+			Message: err.Error(),
+		}, err
+	}
+
+	a.configurationSubscribeLock.Lock()
+	defer a.configurationSubscribeLock.Unlock()
+
+	subscribeID := request.GetId()
+
+	stop, ok := a.configurationSubscribe[subscribeID]
+	if !ok {
+		return &runtimev1pb.UnsubscribeConfigurationResponse{
+			Ok: true,
+		}, nil
+	}
+	delete(a.configurationSubscribe, subscribeID)
+	close(stop)
+
+	policy := a.resiliency.ComponentOutboundPolicy(ctx, request.StoreName)
+
+	start := time.Now()
+	err = policy(func(ctx context.Context) error {
+		return store.Unsubscribe(ctx, &configuration.UnsubscribeRequest{
+			ID: subscribeID,
+		})
+	})
+	elapsed := diag.ElapsedSince(start)
+
+	diag.DefaultComponentMonitoring.ConfigurationInvoked(context.Background(), request.StoreName, diag.ConfigurationUnsubscribe, err == nil, elapsed)
+
+	if err != nil {
+		return &runtimev1pb.UnsubscribeConfigurationResponse{
+			Ok:      false,
+			Message: err.Error(),
+		}, err
+	}
+	return &runtimev1pb.UnsubscribeConfigurationResponse{
+		Ok: true,
+	}, nil
 }

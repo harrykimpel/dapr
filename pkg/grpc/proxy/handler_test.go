@@ -1,4 +1,15 @@
-// Copyright (c) Microsoft Corporation, Dapr Contributors and Michal Witkowski.
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 // Code is based on https://github.com/trusch/grpc-proxy
 
 package proxy
@@ -24,6 +35,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	codec "github.com/dapr/dapr/pkg/grpc/proxy/codec"
+	"github.com/dapr/dapr/pkg/resiliency"
 )
 
 const (
@@ -231,10 +243,10 @@ func (s *ProxyHappySuite) SetupSuite() {
 		return outCtx, s.serverClientConn, nil
 	}
 	s.proxy = grpc.NewServer(
-		grpc.UnknownServiceHandler(TransparentHandler(director)),
+		grpc.UnknownServiceHandler(TransparentHandler(director, resiliency.New(nil), func(string) (bool, error) { return true, nil })),
 	)
 	// Ping handler is handled as an explicit registration and not as a TransparentHandler.
-	RegisterService(s.proxy, director,
+	RegisterService(s.proxy, director, resiliency.New(nil),
 		"mwitkow.testproto.TestService",
 		"Ping")
 

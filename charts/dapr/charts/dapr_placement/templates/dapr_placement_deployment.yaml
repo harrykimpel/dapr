@@ -24,6 +24,9 @@ spec:
         app.kubernetes.io/component: placement
         app.kubernetes.io/part-of: "dapr"
         app.kubernetes.io/managed-by: "helm"
+        {{- with .Values.global.labels }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
 {{- if eq .Values.global.prometheus.enabled true }}
       annotations:
         prometheus.io/scrape: "{{ .Values.global.prometheus.enabled }}"
@@ -38,23 +41,23 @@ spec:
             path: /healthz
             port: 8080
 {{- if eq .Values.debug.enabled false }}
-          initialDelaySeconds: 10
+          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
 {{- else }}
           initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
 {{- end }}
-          periodSeconds: 3
-          failureThreshold: 5
+          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
         readinessProbe:
           httpGet:
             path: /healthz
             port: 8080
 {{- if eq .Values.debug.enabled false }}
-          initialDelaySeconds: 3
+          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
 {{- else }}
           initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
 {{- end }}
-          periodSeconds: 3
-          failureThreshold: 5
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
 {{- if contains "/" .Values.image.name }}
         image: "{{ .Values.image.name }}"
 {{- else }}

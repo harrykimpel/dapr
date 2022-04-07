@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package operator
 
@@ -17,6 +25,7 @@ import (
 
 	componentsapi "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 	configurationapi "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
+	resiliencyapi "github.com/dapr/dapr/pkg/apis/resiliency/v1alpha1"
 	subscriptionsapi_v1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
 	subscriptionsapi_v2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
 	"github.com/dapr/dapr/pkg/credentials"
@@ -40,7 +49,7 @@ type Operator interface {
 
 type operator struct {
 	ctx         context.Context
-	daprHandler handlers.Handler
+	daprHandler *handlers.DaprHandler
 	apiServer   api.Server
 
 	configName    string
@@ -58,6 +67,7 @@ func init() {
 
 	_ = componentsapi.AddToScheme(scheme)
 	_ = configurationapi.AddToScheme(scheme)
+	_ = resiliencyapi.AddToScheme(scheme)
 	_ = subscriptionsapi_v1alpha1.AddToScheme(scheme)
 	_ = subscriptionsapi_v2alpha1.AddToScheme(scheme)
 }
@@ -90,10 +100,10 @@ func NewOperator(config, certChainPath string, enableLeaderElection bool) Operat
 		certChainPath: certChainPath,
 	}
 	o.apiServer = api.NewAPIServer(o.client)
-	if componentInfomer, err := mgr.GetCache().GetInformer(context.TODO(), &componentsapi.Component{}); err != nil {
+	if componentInformer, err := mgr.GetCache().GetInformer(context.TODO(), &componentsapi.Component{}); err != nil {
 		log.Fatalf("unable to get setup components informer, err: %s", err)
 	} else {
-		componentInfomer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		componentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: o.syncComponent,
 			UpdateFunc: func(_, newObj interface{}) {
 				o.syncComponent(newObj)

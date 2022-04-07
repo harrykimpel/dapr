@@ -1,11 +1,20 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package v1
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -174,4 +183,30 @@ func TestAddHeadersDoesNotOverwrite(t *testing.T) {
 	assert.NotNil(t, req.r.Metadata)
 	assert.NotNil(t, req.r.Metadata["Dapr-Reentrant-Id"])
 	assert.Equal(t, "test", req.r.Metadata["Dapr-Reentrant-Id"].Values[0])
+}
+
+func TestWithCustomHTTPMetadata(t *testing.T) {
+	customMetadataKey := func(i int) string {
+		return fmt.Sprintf("customMetadataKey%d", i)
+	}
+	customMetadataValue := func(i int) string {
+		return fmt.Sprintf("customMetadataValue%d", i)
+	}
+
+	numMetadata := 10
+	md := make(map[string]string, numMetadata)
+	for i := 0; i < numMetadata; i++ {
+		md[customMetadataKey(i)] = customMetadataValue(i)
+	}
+
+	req := NewInvokeMethodRequest("test_method")
+	req.WithCustomHTTPMetadata(md)
+
+	imrMd := req.Metadata()
+	for i := 0; i < numMetadata; i++ {
+		val, ok := imrMd[customMetadataKey(i)]
+		assert.True(t, ok)
+		// We assume only 1 value per key as the input map can only support string -> string mapping.
+		assert.Equal(t, customMetadataValue(i), val.Values[0])
+	}
 }

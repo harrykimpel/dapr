@@ -25,6 +25,15 @@ volumeclaims:
 
 replicationFactor: 100
 
+livenessProbe:
+  initialDelaySeconds: 10
+  periodSeconds: 3
+  failureThreshold: 5
+readinessProbe:
+  initialDelaySeconds: 3
+  periodSeconds: 3
+  failureThreshold: 5
+
 debug:
   enabled: false
   port: 40000

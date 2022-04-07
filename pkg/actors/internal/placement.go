@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package internal
 
@@ -49,7 +57,7 @@ type ActorPlacement struct {
 
 	// serverAddr is the list of placement addresses.
 	serverAddr []string
-	// serverIndex is the the current index of placement servers in serverAddr.
+	// serverIndex is the current index of placement servers in serverAddr.
 	serverIndex atomic.Int32
 
 	// clientCert is the workload certificate to connect placement.
@@ -231,7 +239,7 @@ func (p *ActorPlacement) Start() {
 			}
 
 			// appHealthFn is the health status of actor service application. This allows placement to update
-			// memberlist and hashing table quickly.
+			// the member list and hashing table quickly.
 			if !p.appHealthFn() {
 				// app is unresponsive, close the stream and disconnect from the placement service.
 				// Then Placement will remove this host from the member list.
